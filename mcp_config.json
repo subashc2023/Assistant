@@ -1,0 +1,25 @@
+{
+    "mcpServers": {
+        "filesystem": {
+            "command": "npx",
+            "args": [
+              "-y",
+              "@modelcontextprotocol/server-filesystem",
+              "C:\\workspace\\environment\\Assistant"
+            ]
+        },
+        "sqlite": {
+            "command": "docker",
+            "args": [
+                "run",
+                "--rm",
+                "-i",
+                "-v",
+                "./data:/mcp",
+                "mcp/sqlite",
+                "--db-path",
+                "/mcp/test.db"
+            ]
+        }  
+    } 
+}
