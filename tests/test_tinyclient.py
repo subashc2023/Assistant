@@ -271,7 +271,7 @@ class TestOrchestratorToolFlow(unittest.IsolatedAsyncioTestCase):
     async def test_no_tool_use_returns_text(self):
         cfg = tc.AppConfig.defaults()
         router = self._Router()
-        orch = tc.AnthropicOrchestrator(cfg, router)
+        orch = tc.LLMOrchestrator(cfg, router)
 
         async def _fake_stream(history, tools, show_header):
             return {"content": "hello"}
@@ -284,7 +284,7 @@ class TestOrchestratorToolFlow(unittest.IsolatedAsyncioTestCase):
     async def test_single_tool_use_then_finish(self):
         cfg = tc.AppConfig.defaults()
         router = self._Router()
-        orch = tc.AnthropicOrchestrator(cfg, router)
+        orch = tc.LLMOrchestrator(cfg, router)
 
         state = {"step": 0}
         async def _fake_stream(history, tools, show_header):
@@ -310,7 +310,7 @@ class TestOrchestratorToolFlow(unittest.IsolatedAsyncioTestCase):
     async def test_duplicate_tool_calls_blocked(self):
         cfg = tc.AppConfig.defaults()
         router = self._Router()
-        orch = tc.AnthropicOrchestrator(cfg, router)
+        orch = tc.LLMOrchestrator(cfg, router)
 
         async def _fake_stream(history, tools, show_header):
             return {
@@ -339,7 +339,7 @@ class TestOrchestratorToolFlow(unittest.IsolatedAsyncioTestCase):
         _tc.TOOL_TIMEOUT_SEC = 0.01
         # Router simulates long-running tool
         router = self._Router(result_delay=0.05)
-        orch = tc.AnthropicOrchestrator(cfg, router)
+        orch = tc.LLMOrchestrator(cfg, router)
 
         async def _fake_stream(history, tools, show_header):
             return {
