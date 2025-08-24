@@ -10,7 +10,6 @@ from typing import Any, Dict, List, Optional
 from dataclasses import dataclass
 from contextlib import AsyncExitStack
 
-from dotenv import load_dotenv
 from anthropic import Anthropic, APIStatusError
 from anthropic.types import Message
 from mcp import ClientSession, StdioServerParameters
@@ -267,14 +266,6 @@ class MCPToolRouter:
                     "input_schema": schema,
                 }
 
-                # warn on collisions; last writer wins (simple policy)
-                if tool_name in self.tool_to_server:
-                    prev = self.tool_to_server[tool_name].name
-                    logger.warning(
-                        "Tool name collision: '%s' from server '%s' overrides server '%s'",
-                        tool_name, server.name, prev
-                    )
-
                 self.tool_to_server[tool_name] = server
                 self.namespaced_to_original[tool_name] = t.name
                 self.anthropic_tool_specs.append(tool_entry)
@@ -475,15 +466,10 @@ class AnthropicOrchestrator:
         return message
 
 
-async def amain():
-    load_dotenv()
+async def amain(config_path: str):
     configure_logging()
 
-    parser = argparse.ArgumentParser(description="Anthropic MCP CLI Chat")
-    parser.add_argument("-c", "--config", default=os.getenv("MCP_CONFIG") or str(CONFIG_FILE), help="Path to mcp_config.json")
-    args = parser.parse_args()
-
-    path_obj = pathlib.Path(args.config)
+    path_obj = pathlib.Path(config_path)
 
     print("=== Anthropic MCP CLI Chat ===")
     print(f"Loading MCP configuration from: {path_obj}")
@@ -497,10 +483,9 @@ async def amain():
     cfg = AppConfig.from_env()
     mcp = MCPToolRouter()
     orchestrator = AnthropicOrchestrator(cfg, mcp)
-    system_prompt = getenv_str("SYSTEM_PROMPT", DEFAULT_SYSTEM_PROMPT)
-    orchestrator.system_prompt = system_prompt
-    if system_prompt:
-        print(f"[Info] System prompt active: {system_prompt[:120]}{'…' if len(system_prompt) > 120 else ''}")
+    orchestrator.system_prompt = DEFAULT_SYSTEM_PROMPT
+    if DEFAULT_SYSTEM_PROMPT:
+        print(f"[Info] System prompt active: {DEFAULT_SYSTEM_PROMPT[:120]}{'…' if len(DEFAULT_SYSTEM_PROMPT) > 120 else ''}")
 
     try: # Startup: load config and start servers
         mcp.load_config(path_obj)
@@ -510,7 +495,7 @@ async def amain():
         server_to_tools: Dict[str, List[str]] = {}# Group tools by server for clearer display
         for tname, srv in mcp.tool_to_server.items():
             sname = srv.name
-            prefix = f"{sname}."
+            prefix = f"{sname}_"
             display = tname[len(prefix):] if tname.startswith(prefix) else tname
             server_to_tools.setdefault(sname, []).append(display)
         for sname in sorted(server_to_tools.keys()):
@@ -562,9 +547,17 @@ async def amain():
         finally:
             print("[Info] Cleanup complete.")
 
-
-if __name__ == "__main__":
+def main():
+    """Application entrypoint for running this module as a script."""
+    parser = argparse.ArgumentParser(description="Anthropic MCP CLI Chat")
+    parser.add_argument(
+        "-c", "--config", default=os.getenv("MCP_CONFIG") or str(CONFIG_FILE), help="Path to mcp_config.json"
+    )
+    args = parser.parse_args()
     try:
-        asyncio.run(amain())
+        asyncio.run(amain(config_path=args.config))
     except (KeyboardInterrupt, asyncio.CancelledError):
         print("\n[Info] Application terminated.")
+
+if __name__ == "__main__":
+    main()
