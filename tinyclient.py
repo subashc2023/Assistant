@@ -1,7 +1,7 @@
 # /// script
 # requires-python = ">=3.13"
 # dependencies = [
-#     "anthropic",
+#     "litellm",
 #     "argparse",
 #     "mcp",
 # ]
@@ -18,15 +18,14 @@ from typing import Any, Dict, List, Optional
 from dataclasses import dataclass
 from contextlib import AsyncExitStack
 
-from anthropic import Anthropic, APIStatusError
-from anthropic.types import Message
+import litellm
 from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client
 
 SCRIPT_DIR = pathlib.Path(__file__).parent.resolve()
 CONFIG_FILE = SCRIPT_DIR / "mcp_config.json"
 
-DEFAULT_MODEL = "claude-3-5-sonnet-20241022"
+DEFAULT_MODEL = "gpt-4o-mini"
 DEFAULT_MAX_TOKENS = 1500
 DEFAULT_MAX_TOOL_HOPS = 8
 # Fixed internal timeout for tool calls (not user-configurable)
@@ -49,10 +48,17 @@ def configure_logging(level_name: Optional[str] = None) -> None:
     logging.basicConfig(level=level, format="%(asctime)s %(levelname)s %(message)s")
 
     # Quiet noisy third-party INFO logs during interactive streaming
-    logging.getLogger("anthropic").setLevel(logging.WARNING)
     logging.getLogger("httpx").setLevel(logging.WARNING)
     logging.getLogger("anyio").setLevel(logging.WARNING)
     logging.getLogger("mcp").setLevel(logging.WARNING)
+    # Mute LiteLLM's own INFO prints
+    try:
+        # Disable verbose prints controlled by the package
+        litellm.set_verbose = False  # type: ignore[attr-defined]
+    except Exception:
+        pass
+    logging.getLogger("LiteLLM").setLevel(logging.WARNING)
+    logging.getLogger("litellm").setLevel(logging.WARNING)
 
 @dataclass(frozen=True)
 class AppConfig:
@@ -125,18 +131,6 @@ def format_tool_result_for_llm(result, max_chars: int = 8000) -> str:
     except Exception:
         return pretty_json(str(result))
 
-
-def ui_tool_start(name: str, args: Dict[str, Any]) -> None:
-    print(f"→ {name} {compact_json(args)}", flush=True)
-
-
-def ui_tool_result(name: str, content: str, is_error: bool, duration_s: Optional[float] = None) -> None:
-    status = "error" if is_error else "ok"
-    dur = f" ({duration_s:.2f}s)" if duration_s is not None else ""
-    print(f"← {name}: {status}{dur}", flush=True)
-    if content:
-        print(content, flush=True)
-
 class MCPServer:
 
     def __init__(self, name: str, config: Dict[str, Any]):
@@ -206,7 +200,8 @@ class MCPToolRouter:
     def __init__(self):
         self.servers: List[MCPServer] = []
         self.config: Dict[str, Any] = {}
-        self.anthropic_tool_specs: List[Dict[str, Any]] = []  # for Anthropic messages API
+        # OpenAI/LiteLLM tools spec: list of {type: "function", function: {name, description, parameters}}
+        self.openai_tool_specs: List[Dict[str, Any]] = []
         self.tool_to_server: Dict[str, MCPServer] = {}   # tool name -> server
         self.namespaced_to_original: Dict[str, str] = {}  # namespaced -> original tool name
 
@@ -223,7 +218,7 @@ class MCPToolRouter:
 
     async def start_all(self) -> None:
         """Initialize all servers and build the aggregated tool registry."""
-        self.anthropic_tool_specs.clear()
+        self.openai_tool_specs.clear()
         self.tool_to_server.clear()
         self.namespaced_to_original.clear()
 
@@ -234,7 +229,7 @@ class MCPToolRouter:
         results = await asyncio.gather(*(init_and_list(s) for s in self.servers))
         for server, tools_resp in results:
             for t in tools_resp.tools:
-                # Anthropic expects {name, description, input_schema}
+                # We normalize to OpenAI-style function tools
                 schema_raw = getattr(t, "inputSchema", None) or getattr(t, "input_schema", None)
                 schema = self._validate_input_schema(schema_raw, server.name, t.name)
                 # Build a unique, compliant namespaced tool name using underscore separator
@@ -245,22 +240,25 @@ class MCPToolRouter:
                     tool_name = f"{base_name}_{suffix}"
                     suffix += 1
                 tool_entry = {
-                    "name": tool_name,
-                    "description": t.description or "",
-                    "input_schema": schema,
+                    "type": "function",
+                    "function": {
+                        "name": tool_name,
+                        "description": t.description or "",
+                        "parameters": schema,
+                    },
                 }
 
                 self.tool_to_server[tool_name] = server
                 self.namespaced_to_original[tool_name] = t.name
-                self.anthropic_tool_specs.append(tool_entry)
+                self.openai_tool_specs.append(tool_entry)
 
-        if not self.anthropic_tool_specs:
+        if not self.openai_tool_specs:
             logger.warning("No tools found from any MCP server.")
         else:
-            logger.info("Loaded %d tools from %d servers.", len(self.anthropic_tool_specs), len(self.servers))
+            logger.info("Loaded %d tools from %d servers.", len(self.openai_tool_specs), len(self.servers))
 
     def _validate_input_schema(self, schema: Any, server_name: str, tool_name: str) -> Dict[str, Any]:
-        """Ensure the input_schema is a JSON Schema object type suitable for Anthropic tools.
+        """Ensure the input schema is a JSON Schema object type suitable for OpenAI tools.
 
         Rules:
         - If schema is None: return {"type": "object"}
@@ -300,12 +298,11 @@ class MCPToolRouter:
 
 
 class AnthropicOrchestrator:
-    """Streams responses, handles multi-hop tool_use -> tool_result protocol."""
+    """Streams responses, handles multi-hop tool_calls -> tool results using LiteLLM."""
 
     def __init__(self, cfg: AppConfig, mcp: MCPToolRouter):
         self.cfg = cfg
         self.mcp = mcp
-        self.client = Anthropic()  # reads ANTHROPIC_API_KEY
         self.conversation: List[Dict[str, Any]] = []
         self.system_prompt: str = ""
         # Parallel tool execution controls
@@ -321,26 +318,30 @@ class AnthropicOrchestrator:
 
         for hop in range(self.cfg.max_tool_hops):
             # Show header only on the first streamed assistant turn
-            msg = await self._call_llm_streaming(self.conversation, tools=self.mcp.anthropic_tool_specs, show_header=(hop == 0))
+            assistant_msg = await self._call_llm_streaming(self.conversation, tools=self.mcp.openai_tool_specs, show_header=(hop == 0))
 
-            # Gather text blocks
-            text_blocks = [b for b in msg.content if getattr(b, "type", None) == "text"]
-            for tb in text_blocks:
-                if tb.text:
-                    final_text_fragments.append(tb.text)
-            self.conversation.append({"role": "assistant", "content": msg.content})
-            
-            tool_uses = [b for b in msg.content if getattr(b, "type", None) == "tool_use"]
-            if not tool_uses:
+            # Accumulate streamed text content
+            if assistant_msg.get("content"):
+                final_text_fragments.append(assistant_msg["content"])
+
+            # Append assistant message (includes tool_calls if any)
+            self.conversation.append({
+                "role": "assistant",
+                "content": assistant_msg.get("content", ""),
+                **({"tool_calls": assistant_msg.get("tool_calls")} if assistant_msg.get("tool_calls") else {}),
+            })
+
+            tool_calls = assistant_msg.get("tool_calls") or []
+            if not tool_calls:
                 break  # no tools requested -> finish
 
             # Execute tools (optionally in parallel) for this hop
-            tool_results_content: List[Dict[str, Any]] = [None] * len(tool_uses)  # type: ignore
-            result_meta: List[Optional[Dict[str, Any]]] = [None] * len(tool_uses)
-            result_blocks: List[Optional[str]] = [None] * len(tool_uses)
+            tool_results_msgs: List[Optional[Dict[str, Any]]] = [None] * len(tool_calls)
+            result_meta: List[Optional[Dict[str, Any]]] = [None] * len(tool_calls)
+            result_blocks: List[Optional[str]] = [None] * len(tool_calls)
             seen_tools: set = set()
 
-            async def _run_one(idx: int, name: str, args: Dict[str, Any], tool_use_id: str, sem: Optional[asyncio.Semaphore]):
+            async def _run_one(idx: int, name: str, args: Dict[str, Any], tool_call_id: str, sem: Optional[asyncio.Semaphore]):
                 label = str(idx + 1)
                 async def _body():
                     # Print concise invocation line atomically
@@ -356,9 +357,10 @@ class AnthropicOrchestrator:
                         result_blocks[idx] = block
                         logger.info("Tool '%s' finished in %.2fs", name, _dur)
                         result_meta[idx] = {"name": name, "ok": True, "duration": _dur}
-                        tool_results_content[idx] = {
-                            "type": "tool_result",
-                            "tool_use_id": tool_use_id,
+                        tool_results_msgs[idx] = {
+                            "role": "tool",
+                            "tool_call_id": tool_call_id,
+                            "name": name,
                             "content": content,
                         }
                     except asyncio.TimeoutError:
@@ -367,11 +369,11 @@ class AnthropicOrchestrator:
                         block = f"← [{label}] {name}: error\n{err}"
                         result_blocks[idx] = block
                         result_meta[idx] = {"name": name, "ok": False, "error": "timeout"}
-                        tool_results_content[idx] = {
-                            "type": "tool_result",
-                            "tool_use_id": tool_use_id,
+                        tool_results_msgs[idx] = {
+                            "role": "tool",
+                            "tool_call_id": tool_call_id,
+                            "name": name,
                             "content": err,
-                            "is_error": True,
                         }
                     except Exception as e:
                         err = f"ERROR: tool '{name}' failed: {e!r}"
@@ -379,11 +381,11 @@ class AnthropicOrchestrator:
                         block = f"← [{label}] {name}: error\n{err}"
                         result_blocks[idx] = block
                         result_meta[idx] = {"name": name, "ok": False, "error": "exception"}
-                        tool_results_content[idx] = {
-                            "type": "tool_result",
-                            "tool_use_id": tool_use_id,
+                        tool_results_msgs[idx] = {
+                            "role": "tool",
+                            "tool_call_id": tool_call_id,
+                            "name": name,
                             "content": err,
-                            "is_error": True,
                         }
 
                 if sem is None:
@@ -397,9 +399,13 @@ class AnthropicOrchestrator:
             if self.parallel_tools_enabled and self.max_parallel_tools and self.max_parallel_tools > 0:
                 sem = asyncio.Semaphore(self.max_parallel_tools)
 
-            for idx, tu in enumerate(tool_uses):
-                name = tu.name
-                args = tu.input or {}
+            for idx, tc in enumerate(tool_calls):
+                name = tc.get("function", {}).get("name") or tc.get("name")
+                raw_args = tc.get("function", {}).get("arguments", "{}")
+                try:
+                    args = json.loads(raw_args) if isinstance(raw_args, str) else (raw_args or {})
+                except Exception:
+                    args = {"_raw": raw_args}
                 key = (name, json.dumps(args, sort_keys=True, ensure_ascii=False))
                 if key in seen_tools:
                     err = f"ERROR: repeated identical tool call prevented for {name}"
@@ -407,19 +413,19 @@ class AnthropicOrchestrator:
                     block = f"← [{label}] {name}: error\n{err}"
                     result_blocks[idx] = block
                     result_meta[idx] = {"name": name, "ok": False, "error": "duplicate"}
-                    tool_results_content[idx] = {
-                        "type": "tool_result",
-                        "tool_use_id": tu.id,
+                    tool_results_msgs[idx] = {
+                        "role": "tool",
+                        "tool_call_id": tc.get("id", f"tc_{idx}"),
+                        "name": name,
                         "content": err,
-                        "is_error": True,
                     }
                     continue
                 seen_tools.add(key)
 
                 if self.parallel_tools_enabled:
-                    tasks.append(asyncio.create_task(_run_one(idx, name, args, tu.id, sem)))
+                    tasks.append(asyncio.create_task(_run_one(idx, name, args, tc.get("id", f"tc_{idx}"), sem)))
                 else:
-                    await _run_one(idx, name, args, tu.id, None)
+                    await _run_one(idx, name, args, tc.get("id", f"tc_{idx}"), None)
 
             if tasks:
                 await asyncio.gather(*tasks)
@@ -448,29 +454,84 @@ class AnthropicOrchestrator:
             except Exception:
                 pass
 
-            # Feed results back as a user turn containing tool_result blocks
-            # Filter Nones in case there are any, but preserve order
-            self.conversation.append({
-                "role": "user",
-                "content": [tr for tr in tool_results_content if tr is not None],
-            })
+            # Feed results back as tool role messages (OpenAI style)
+            for msg in tool_results_msgs:
+                if msg is not None:
+                    self.conversation.append(msg)
 
         return "\n".join([t for t in final_text_fragments if t])
 
-    async def _call_llm_streaming(self, history: List[Dict[str, Any]], tools: Optional[List[Dict[str, Any]]], show_header: bool) -> Message:
-        # Run sync streaming in a worker thread
+    async def _call_llm_streaming(self, history: List[Dict[str, Any]], tools: Optional[List[Dict[str, Any]]], show_header: bool) -> Dict[str, Any]:
         retry_delays = [1.0, 3.0, 5.0]  # seconds
         attempt = 0
         while True:
             try:
-                return await asyncio.to_thread(self._sync_stream_request, history, tools, show_header)
-            except APIStatusError as e:
-                if attempt >= len(retry_delays):
-                    raise
-                delay = retry_delays[attempt]
-                attempt += 1
-                logger.warning("LLM API error %s: %s — retrying in %.2fs", getattr(e, "status_code", "?"), getattr(e, "message", str(e)), delay)
-                await asyncio.sleep(delay)
+                # Build messages with optional system prefix
+                messages: List[Dict[str, Any]] = []
+                if self.system_prompt:
+                    messages.append({"role": "system", "content": self.system_prompt})
+                messages.extend(history)
+                kwargs = dict(model=self.cfg.model, max_tokens=self.cfg.max_tokens, messages=messages, stream=True)
+                if tools:
+                    kwargs["tools"] = tools
+                    kwargs["tool_choice"] = "auto"
+
+                if show_header:
+                    print("\n[Assistant]", end=" ", flush=True)
+
+                chunks: List[Any] = []
+                stream = await litellm.acompletion(**kwargs)
+                saw_toolcall_notice: bool = False
+                async for chunk in stream:
+                    chunks.append(chunk)
+                    try:
+                        choice = chunk.choices[0]
+                        delta = choice.delta
+                        # Print text tokens as they arrive
+                        text = getattr(delta, "content", None) or (delta.get("content") if isinstance(delta, dict) else None)
+                        if text:
+                            print(text, end="", flush=True)
+                        # If the model pivots to tool_calls, surface a brief notice so it doesn't look frozen
+                        has_tool_delta = False
+                        if isinstance(delta, dict):
+                            has_tool_delta = bool(delta.get("tool_calls") or delta.get("function_call"))
+                        else:
+                            try:
+                                has_tool_delta = bool(getattr(delta, "tool_calls", None) or getattr(delta, "function_call", None))
+                            except Exception:
+                                has_tool_delta = False
+                        if has_tool_delta and not saw_toolcall_notice:
+                            saw_toolcall_notice = True
+                            print(" … [requesting tools]", end="", flush=True)
+                        # If finish_reason indicates tool_calls, we can stop reading; the stream is complete
+                        fr = getattr(choice, "finish_reason", None)
+                        if fr is None and isinstance(choice, dict):
+                            fr = choice.get("finish_reason")
+                        if fr == "tool_calls":
+                            break
+                    except Exception:
+                        pass
+                # Build final response from chunks
+                final_resp = litellm.stream_chunk_builder(chunks, messages=messages)
+                # Extract assistant message
+                msg = final_resp.choices[0].message
+                out: Dict[str, Any] = {
+                    "content": getattr(msg, "content", None) or (msg.get("content") if isinstance(msg, dict) else ""),
+                }
+                tc = getattr(msg, "tool_calls", None) or (msg.get("tool_calls") if isinstance(msg, dict) else None)
+                if tc:
+                    # Normalize to list of dicts
+                    def _to_dict(x: Any) -> Any:
+                        try:
+                            return x.model_dump()  # pydantic
+                        except Exception:
+                            try:
+                                return x.dict()
+                            except Exception:
+                                return x
+                    out["tool_calls"] = [_to_dict(x) for x in tc]
+                print()
+                return out
             except Exception as e:
                 if attempt >= len(retry_delays):
                     raise
@@ -478,32 +539,6 @@ class AnthropicOrchestrator:
                 attempt += 1
                 logger.warning("LLM error: %r — retrying in %.2fs", e, delay)
                 await asyncio.sleep(delay)
-
-    def _sync_stream_request(self, history: List[Dict[str, Any]], tools: Optional[List[Dict[str, Any]]], show_header: bool) -> Message:
-        # Filter out any 'system' role messages (Anthropic expects top-level system param)
-        filtered_history = [m for m in history if m.get("role") != "system"]
-        kwargs = dict(model=self.cfg.model, max_tokens=self.cfg.max_tokens, messages=filtered_history)
-        if tools:
-            kwargs["tools"] = tools
-        if self.system_prompt:
-            kwargs["system"] = self.system_prompt
-
-        if show_header:
-            print("\n[Assistant]", end=" ", flush=True)
-        with self.client.messages.stream(**kwargs) as stream:
-            for ev in stream:
-                # Stream assistant text as it arrives
-                if ev.type == "content_block_delta" and getattr(ev, "delta", None):
-                    if getattr(ev.delta, "type", None) == "text_delta":
-                        text = ev.delta.text or ""
-                        if text:
-                            print(text, end="", flush=True)
-                # Suppress verbose tool_use announcements; we print concise invocation lines elsewhere
-                elif ev.type == "content_block_start" and getattr(ev, "content_block", None):
-                    pass
-            message: Message = stream.get_final_message()
-        print() 
-        return message
 
 
 async def amain(
@@ -522,7 +557,7 @@ async def amain(
 
     path_obj = pathlib.Path(config_path)
 
-    print("=== Anthropic MCP CLI Chat ===")
+    print("=== LiteLLM MCP CLI Chat ===")
     print(f"Loading MCP configuration from: {path_obj}")
     print("Type 'quit' to exit.\n")
 

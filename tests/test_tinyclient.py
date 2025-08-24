@@ -9,6 +9,26 @@ import unittest
 import types as _types
 
 # Provide minimal fakes for external deps so importing tinyclient doesn't require them.
+if "litellm" not in sys.modules:
+    litellm = _types.ModuleType("litellm")
+    async def _acompletion(**_kwargs):
+        class _Stream:
+            def __aiter__(self):
+                return self
+            async def __anext__(self):
+                raise StopAsyncIteration
+        return _Stream()
+    def _stream_chunk_builder(_chunks, messages=None):
+        class _MsgObj:
+            def __init__(self):
+                self.message = {"content": ""}
+        class _Resp:
+            def __init__(self):
+                self.choices = [_MsgObj()]
+        return _Resp()
+    litellm.acompletion = _acompletion
+    litellm.stream_chunk_builder = _stream_chunk_builder
+    sys.modules["litellm"] = litellm
 if "anthropic" not in sys.modules:
     anthropic = _types.ModuleType("anthropic")
     class _APIStatusError(Exception):
@@ -167,9 +187,9 @@ class TestMCPToolRouter(unittest.IsolatedAsyncioTestCase):
         router.servers = [self._FakeServer("srvA"), self._FakeServer("srvB")]
         await router.start_all()
         # Expect 3 tools per server, 6 total entries with namespaced keys
-        self.assertEqual(len(router.anthropic_tool_specs), 6)
+        self.assertEqual(len(router.openai_tool_specs), 6)
         # Names should be unique even with duplicates (list, list_2)
-        names = {spec["name"] for spec in router.anthropic_tool_specs}
+        names = {spec["function"]["name"] for spec in router.openai_tool_specs}
         # Expect two entries from srvA named srvA_list and srvA_list_2
         self.assertIn("srvA_list", names)
         self.assertIn("srvA_list_2", names)
@@ -233,19 +253,12 @@ class TestRouterCallRouting(unittest.IsolatedAsyncioTestCase):
 
 class TestOrchestratorToolFlow(unittest.IsolatedAsyncioTestCase):
 
-    class _Block:
-        def __init__(self, type: str, **kwargs):
-            self.type = type
-            for k, v in kwargs.items():
-                setattr(self, k, v)
-
-    class _Message:
-        def __init__(self, content):
-            self.content = content
-
     class _Router:
         def __init__(self, result_delay: float = 0.0):
-            self.anthropic_tool_specs = [{"name": "alpha_list", "description": "", "input_schema": {}}]
+            self.openai_tool_specs = [{
+                "type": "function",
+                "function": {"name": "alpha_list", "description": "", "parameters": {"type": "object"}},
+            }]
             self.calls = []
             self.result_delay = result_delay
         async def call_tool(self, name: str, arguments: dict):
@@ -261,7 +274,7 @@ class TestOrchestratorToolFlow(unittest.IsolatedAsyncioTestCase):
         orch = tc.AnthropicOrchestrator(cfg, router)
 
         async def _fake_stream(history, tools, show_header):
-            return self._Message([self._Block("text", text="hello")])
+            return {"content": "hello"}
 
         orch._call_llm_streaming = _fake_stream  # type: ignore
         out = await orch.run_single_turn("hi")
@@ -277,12 +290,14 @@ class TestOrchestratorToolFlow(unittest.IsolatedAsyncioTestCase):
         async def _fake_stream(history, tools, show_header):
             if state["step"] == 0:
                 state["step"] += 1
-                return self._Message([
-                    self._Block("text", text="working"),
-                    self._Block("tool_use", name="alpha_list", id="t1", input={"path": "/"}),
-                ])
+                return {
+                    "content": "working",
+                    "tool_calls": [
+                        {"id": "t1", "function": {"name": "alpha_list", "arguments": json.dumps({"path": "/"})}}
+                    ],
+                }
             else:
-                return self._Message([self._Block("text", text="done")])
+                return {"content": "done"}
 
         orch._call_llm_streaming = _fake_stream  # type: ignore
         out = await orch.run_single_turn("list please")
@@ -298,10 +313,13 @@ class TestOrchestratorToolFlow(unittest.IsolatedAsyncioTestCase):
         orch = tc.AnthropicOrchestrator(cfg, router)
 
         async def _fake_stream(history, tools, show_header):
-            return self._Message([
-                self._Block("tool_use", name="alpha_list", id="t1", input={"x": 1}),
-                self._Block("tool_use", name="alpha_list", id="t2", input={"x": 1}),  # duplicate
-            ])
+            return {
+                "content": "",
+                "tool_calls": [
+                    {"id": "t1", "function": {"name": "alpha_list", "arguments": json.dumps({"x": 1})}},
+                    {"id": "t2", "function": {"name": "alpha_list", "arguments": json.dumps({"x": 1})}},
+                ],
+            }
 
         orch._call_llm_streaming = _fake_stream  # type: ignore
         # Capture stdout to check printed error
@@ -324,9 +342,12 @@ class TestOrchestratorToolFlow(unittest.IsolatedAsyncioTestCase):
         orch = tc.AnthropicOrchestrator(cfg, router)
 
         async def _fake_stream(history, tools, show_header):
-            return self._Message([
-                self._Block("tool_use", name="alpha_list", id="t1", input={}),
-            ])
+            return {
+                "content": "",
+                "tool_calls": [
+                    {"id": "t1", "function": {"name": "alpha_list", "arguments": json.dumps({})}},
+                ],
+            }
 
         orch._call_llm_streaming = _fake_stream  # type: ignore
         buf = io.StringIO()
