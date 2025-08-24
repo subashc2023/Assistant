@@ -1,3 +1,11 @@
+# /// script
+# requires-python = ">=3.13"
+# dependencies = [
+#     "anthropic",
+#     "argparse",
+#     "mcp",
+# ]
+# ///
 import os
 import sys
 import json
@@ -61,15 +69,15 @@ class AppConfig:
     tool_result_max_chars: int
 
     @classmethod
-    def from_env(cls) -> "AppConfig":
+    def defaults(cls) -> "AppConfig":
         return cls(
-            model=getenv_str("ANTHROPIC_MODEL", DEFAULT_MODEL),
-            max_tokens=getenv_int("MAX_TOKENS", DEFAULT_MAX_TOKENS),
-            max_tool_hops=getenv_int("MAX_TOOL_HOPS", DEFAULT_MAX_TOOL_HOPS),
-            tool_timeout_sec=getenv_float("TOOL_TIMEOUT_SEC", DEFAULT_TOOL_TIMEOUT_SEC),
-            llm_retries=getenv_int("LLM_RETRIES", DEFAULT_LLM_RETRIES),
-            llm_retry_backoff_sec=getenv_float("LLM_RETRY_BACKOFF_SEC", DEFAULT_LLM_RETRY_BACKOFF_SEC),
-            tool_result_max_chars=getenv_int("TOOL_RESULT_MAX_CHARS", DEFAULT_TOOL_RESULT_MAX_CHARS),
+            model=DEFAULT_MODEL,
+            max_tokens=DEFAULT_MAX_TOKENS,
+            max_tool_hops=DEFAULT_MAX_TOOL_HOPS,
+            tool_timeout_sec=DEFAULT_TOOL_TIMEOUT_SEC,
+            llm_retries=DEFAULT_LLM_RETRIES,
+            llm_retry_backoff_sec=DEFAULT_LLM_RETRY_BACKOFF_SEC,
+            tool_result_max_chars=DEFAULT_TOOL_RESULT_MAX_CHARS,
         )
 
 
@@ -80,32 +88,9 @@ def pretty_json(obj: Any) -> str:
         return str(obj)
 
 
-def getenv_str(name: str, default: str) -> str:
-    value = os.getenv(name)
-    if value is None:
-        return default
-    value = value.strip()
-    return value if value else default
-
-
-def getenv_int(name: str, default: int) -> int:
-    value = os.getenv(name)
-    if value is None or not value.strip():
-        return default
-    try:
-        return int(value)
-    except Exception:
-        return default
-
-
-def getenv_float(name: str, default: float) -> float:
-    value = os.getenv(name)
-    if value is None or not value.strip():
-        return default
-    try:
-        return float(value)
-    except Exception:
-        return default
+def _unused(*_args: object, **_kwargs: object) -> None:
+    # Kept as a stub to avoid accidental reintroduction of env overrides.
+    return None
 
 
 def _resolve_command(cmd: str) -> str:
@@ -480,7 +465,7 @@ async def amain(config_path: str):
         print("Create a JSON file named mcp_config.json next to this script (see example below), or pass --config.")
         sys.exit(1)
 
-    cfg = AppConfig.from_env()
+    cfg = AppConfig.defaults()
     mcp = MCPToolRouter()
     orchestrator = AnthropicOrchestrator(cfg, mcp)
     orchestrator.system_prompt = DEFAULT_SYSTEM_PROMPT
@@ -507,6 +492,7 @@ async def amain(config_path: str):
         sys.exit(1)
 
     # Interactive loop
+    request_cleanup_data: bool = False
     try:
         while True:
             try:
@@ -525,6 +511,10 @@ async def amain(config_path: str):
             if user == "/history":
                 print(pretty_json(orchestrator.conversation))
                 continue
+            if user == "/clean":
+                request_cleanup_data = True
+                print("[Info] Cleanup requested. Shutting down MCP servers…")
+                break
             if not user:
                 continue
 
@@ -545,13 +535,24 @@ async def amain(config_path: str):
         except BaseException as e:
             logger.warning("Cleanup encountered an error: %r", e)
         finally:
+            try:
+                if request_cleanup_data:
+                    data_dir = SCRIPT_DIR / "data"
+                    if data_dir.exists():
+                        try:
+                            shutil.rmtree(str(data_dir))
+                            print(f"[Info] Removed data directory: {data_dir}")
+                        except Exception as e:
+                            print(f"[Warn] Could not remove data directory {data_dir}: {e}")
+            except Exception as e:
+                logger.warning("Cleanup deletion encountered an error: %r", e)
             print("[Info] Cleanup complete.")
 
 def main():
     """Application entrypoint for running this module as a script."""
     parser = argparse.ArgumentParser(description="Anthropic MCP CLI Chat")
     parser.add_argument(
-        "-c", "--config", default=os.getenv("MCP_CONFIG") or str(CONFIG_FILE), help="Path to mcp_config.json"
+        "-c", "--config", default=str(CONFIG_FILE), help="Path to mcp_config.json"
     )
     args = parser.parse_args()
     try:
