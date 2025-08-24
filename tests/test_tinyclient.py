@@ -125,12 +125,12 @@ class TestUIToolPrinting(unittest.TestCase):
         buf = io.StringIO()
         with contextlib.redirect_stdout(buf):
             tc.ui_tool_start("example_tool", {"a": 1})
-            tc.ui_tool_result("ok", is_error=False)
-            tc.ui_tool_result("bad", is_error=True)
+            tc.ui_tool_result("example_tool", "ok", is_error=False, duration_s=0.0)
+            tc.ui_tool_result("example_tool", "bad", is_error=True)
         text = buf.getvalue()
-        self.assertIn("→ Tool: example_tool", text)
-        self.assertIn("← Result:\nok", text)
-        self.assertIn("← Result (error): bad", text)
+        self.assertIn("→ example_tool", text)
+        self.assertIn("← example_tool: ok", text)
+        self.assertIn("← example_tool: error", text)
 
 
 class TestMCPToolRouter(unittest.IsolatedAsyncioTestCase):

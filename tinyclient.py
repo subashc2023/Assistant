@@ -78,6 +78,13 @@ def pretty_json(obj: Any) -> str:
         return str(obj)
 
 
+def compact_json(obj: Any) -> str:
+    try:
+        return json.dumps(obj, ensure_ascii=False, separators=(",", ":"))
+    except Exception:
+        return str(obj)
+
+
 def _unused(*_args: object, **_kwargs: object) -> None:
     # Kept as a stub to avoid accidental reintroduction of env overrides.
     return None
@@ -120,14 +127,15 @@ def format_tool_result_for_llm(result, max_chars: int = 8000) -> str:
 
 
 def ui_tool_start(name: str, args: Dict[str, Any]) -> None:
-    print(f"\n→ Tool: {name} {pretty_json(args)}\n", flush=True)
+    print(f"→ {name} {compact_json(args)}", flush=True)
 
 
-def ui_tool_result(content: str, is_error: bool) -> None:
-    if is_error:
-        print(f"← Result (error): {content}\n", flush=True)
-    else:
-        print(f"← Result:\n{content}\n", flush=True)
+def ui_tool_result(name: str, content: str, is_error: bool, duration_s: Optional[float] = None) -> None:
+    status = "error" if is_error else "ok"
+    dur = f" ({duration_s:.2f}s)" if duration_s is not None else ""
+    print(f"← {name}: {status}{dur}", flush=True)
+    if content:
+        print(content, flush=True)
 
 class MCPServer:
 
@@ -303,6 +311,8 @@ class AnthropicOrchestrator:
         # Parallel tool execution controls
         self.parallel_tools_enabled: bool = True
         self.max_parallel_tools: Optional[int] = 4
+        # Serialize stdout blocks to avoid interleaving
+        self._print_lock = asyncio.Lock()
 
 
     async def run_single_turn(self, user_text: str) -> str: # runs a single user assistant turn of the conversation
@@ -326,20 +336,26 @@ class AnthropicOrchestrator:
 
             # Execute tools (optionally in parallel) for this hop
             tool_results_content: List[Dict[str, Any]] = [None] * len(tool_uses)  # type: ignore
+            result_meta: List[Optional[Dict[str, Any]]] = [None] * len(tool_uses)
+            result_blocks: List[Optional[str]] = [None] * len(tool_uses)
             seen_tools: set = set()
 
             async def _run_one(idx: int, name: str, args: Dict[str, Any], tool_use_id: str, sem: Optional[asyncio.Semaphore]):
+                label = str(idx + 1)
                 async def _body():
-                    # Inline, user-friendly tool invocation print
-                    ui_tool_start(name, args)
+                    # Print concise invocation line atomically
+                    async with self._print_lock:
+                        print(f"→ [{label}] {name} {compact_json(args)}", flush=True)
                     try:
                         import time as _time2
                         _t0 = _time2.monotonic()
                         result = await asyncio.wait_for(self.mcp.call_tool(name, args), timeout=TOOL_TIMEOUT_SEC)
                         content = format_tool_result_for_llm(result, self.cfg.tool_result_max_chars)
-                        ui_tool_result(content, is_error=False)
                         _dur = _time2.monotonic() - _t0
+                        block = f"← [{label}] {name}: ok ({_dur:.2f}s)" + (f"\n{content}" if content else "")
+                        result_blocks[idx] = block
                         logger.info("Tool '%s' finished in %.2fs", name, _dur)
+                        result_meta[idx] = {"name": name, "ok": True, "duration": _dur}
                         tool_results_content[idx] = {
                             "type": "tool_result",
                             "tool_use_id": tool_use_id,
@@ -348,7 +364,9 @@ class AnthropicOrchestrator:
                     except asyncio.TimeoutError:
                         err = f"ERROR: tool '{name}' timed out after {TOOL_TIMEOUT_SEC}s."
                         logger.warning(err)
-                        ui_tool_result(err, is_error=True)
+                        block = f"← [{label}] {name}: error\n{err}"
+                        result_blocks[idx] = block
+                        result_meta[idx] = {"name": name, "ok": False, "error": "timeout"}
                         tool_results_content[idx] = {
                             "type": "tool_result",
                             "tool_use_id": tool_use_id,
@@ -358,7 +376,9 @@ class AnthropicOrchestrator:
                     except Exception as e:
                         err = f"ERROR: tool '{name}' failed: {e!r}"
                         logger.warning(err)
-                        ui_tool_result(err, is_error=True)
+                        block = f"← [{label}] {name}: error\n{err}"
+                        result_blocks[idx] = block
+                        result_meta[idx] = {"name": name, "ok": False, "error": "exception"}
                         tool_results_content[idx] = {
                             "type": "tool_result",
                             "tool_use_id": tool_use_id,
@@ -383,7 +403,10 @@ class AnthropicOrchestrator:
                 key = (name, json.dumps(args, sort_keys=True, ensure_ascii=False))
                 if key in seen_tools:
                     err = f"ERROR: repeated identical tool call prevented for {name}"
-                    ui_tool_result(err, is_error=True)
+                    label = str(idx + 1)
+                    block = f"← [{label}] {name}: error\n{err}"
+                    result_blocks[idx] = block
+                    result_meta[idx] = {"name": name, "ok": False, "error": "duplicate"}
                     tool_results_content[idx] = {
                         "type": "tool_result",
                         "tool_use_id": tu.id,
@@ -400,6 +423,30 @@ class AnthropicOrchestrator:
 
             if tasks:
                 await asyncio.gather(*tasks)
+
+            # Print result blocks in index order to preserve readability
+            async with self._print_lock:
+                for blk in result_blocks:
+                    if blk:
+                        print(blk, flush=True)
+
+            # Print concise hop summary for human correlation
+            try:
+                parts: List[str] = []
+                for i, meta in enumerate(result_meta):
+                    label = str(i + 1)
+                    if not meta:
+                        parts.append(f"[{label}]=pending")
+                        continue
+                    if meta.get("ok"):
+                        dur = meta.get("duration", 0.0)
+                        parts.append(f"[{label}]=ok {dur:.2f}s {meta.get('name')}")
+                    else:
+                        parts.append(f"[{label}]=error {meta.get('name')} ({meta.get('error')})")
+                async with self._print_lock:
+                    print("[tools] " + "; ".join(parts), flush=True)
+            except Exception:
+                pass
 
             # Feed results back as a user turn containing tool_result blocks
             # Filter Nones in case there are any, but preserve order
@@ -451,12 +498,9 @@ class AnthropicOrchestrator:
                         text = ev.delta.text or ""
                         if text:
                             print(text, end="", flush=True)
-                # Announce tool_use as soon as the assistant emits it (before the turn ends)
+                # Suppress verbose tool_use announcements; we print concise invocation lines elsewhere
                 elif ev.type == "content_block_start" and getattr(ev, "content_block", None):
-                    cb = ev.content_block
-                    if getattr(cb, "type", None) == "tool_use":
-                        tool_name = getattr(cb, "name", None) or "tool"
-                        print(f"\n→ Tool requested: {tool_name}", flush=True)
+                    pass
             message: Message = stream.get_final_message()
         print() 
         return message
@@ -636,9 +680,6 @@ def main():
             model=args.model,
             max_tokens=args.max_tokens,
             max_tool_hops=args.max_tool_hops,
-            tool_timeout_sec=args.tool_timeout_sec,
-            llm_retries=args.llm_retries,
-            llm_retry_backoff_sec=args.llm_retry_backoff_sec,
             tool_result_max_chars=args.tool_result_max_chars,
             system_prompt=args.system_prompt,
             system_prompt_file=args.system_prompt_file,
