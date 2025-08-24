@@ -60,7 +60,18 @@ def log_event(event: str, **fields: Any) -> None:
     """Emit optional structured JSON logs for ops."""
     if not LOG_JSON:
         return
-    payload = {"event": event, "ts": time.time(), **fields}
+    # Avoid dumping huge blobs
+    trimmed = {}
+    for k, v in fields.items():
+        try:
+            s = json.dumps(v, ensure_ascii=False)
+        except Exception:
+            s = str(v)
+        if len(s) > 2000:
+            trimmed[k] = s[:2000] + "…"
+        else:
+            trimmed[k] = v
+    payload = {"event": event, "ts": time.time(), **trimmed}
     try:
         # Send to stderr to avoid interleaving with streamed assistant text
         print(json.dumps(payload, ensure_ascii=False), file=sys.stderr, flush=True)
@@ -84,10 +95,13 @@ def _infer_provider_env_vars(model_name: str) -> Tuple[str, List[str]]:
 def configure_logging(level_name: Optional[str] = None) -> None:
     level_name = level_name or DEFAULT_LOG_LEVEL
     level = getattr(logging, level_name, logging.INFO)
-    logging.basicConfig(level=level, format="%(asctime)s %(levelname)s %(message)s")
+    logging.basicConfig(level=level, format="%(levelname)s %(message)s", force=True)
     logging.getLogger("httpx").setLevel(logging.WARNING)
     logging.getLogger("anyio").setLevel(logging.WARNING)
     logging.getLogger("mcp").setLevel(logging.WARNING)
+    logging.getLogger("urllib3").setLevel(logging.WARNING)
+    logging.getLogger("openai").setLevel(logging.WARNING)
+    logging.getLogger().handlers[0].setFormatter(logging.Formatter("%(levelname)s %(message)s"))
     try:
         litellm.set_verbose = False
     except Exception:
@@ -222,7 +236,7 @@ def _resolve_command(cmd: str) -> str:
     return resolved
 
 
-def format_tool_result_for_llm(result, max_chars: int = 8000) -> str:
+def format_tool_result_for_llm(result, max_chars: int = 8000) -> Tuple[str, bool, int]:
     try:
         if hasattr(result, "content") and isinstance(result.content, list):
             parts: List[str] = []
@@ -234,10 +248,21 @@ def format_tool_result_for_llm(result, max_chars: int = 8000) -> str:
                     to_dict = getattr(c, "to_dict", None)
                     parts.append(pretty_json(to_dict() if callable(to_dict) else c))
             text = "\n".join(parts).strip()
-            return (text[:max_chars] + "\n… [truncated]") if len(text) > max_chars else (text or "[tool returned empty content]")
-        return pretty_json(result)
+            total = len(text)
+            if total > max_chars:
+                return (text[:max_chars], True, total)
+            return (text or "[tool returned empty content]", False, total)
+        text = pretty_json(result)
+        total = len(text)
+        if total > max_chars:
+            return (text[:max_chars], True, total)
+        return (text, False, total)
     except Exception:
-        return pretty_json(str(result))
+        s = pretty_json(str(result))
+        total = len(s)
+        if total > max_chars:
+            return (s[:max_chars], True, total)
+        return (s, False, total)
 
 
 class MCPServer:
@@ -447,26 +472,29 @@ class LLMOrchestrator:
                         import time as _time2
                         _t0 = _time2.monotonic()
                         result = await asyncio.wait_for(self.mcp.call_tool(name, args), timeout=TOOL_TIMEOUT_SEC)
-                        content = format_tool_result_for_llm(result, self.cfg.tool_result_max_chars)
+                        content_text, was_trunc, total_len = format_tool_result_for_llm(
+                            result, self.cfg.tool_result_max_chars
+                        )
                         _dur = _time2.monotonic() - _t0
                         try:
-                            num_lines = len(content.splitlines()) if content else 0
+                            num_lines = len(content_text.splitlines()) if content_text else 0
                         except Exception:
                             num_lines = 0
                         block = f"← [{label}] {name}: ok ({_dur:.2f}s) [{num_lines} lines]"
                         result_blocks[idx] = block
                         logger.info("Tool '%s' finished in %.2fs", name, _dur)
                         log_event("tool_finish", name=name, index=idx, ok=True, duration=_dur, lines=num_lines)
-                        if self.tool_preview_lines and content:
-                            preview = "\n".join(content.splitlines()[: self.tool_preview_lines])
+                        if self.tool_preview_lines and content_text:
+                            preview = "\n".join(content_text.splitlines()[: self.tool_preview_lines])
                             async with self._print_lock:
                                 print(preview, flush=True)
                         result_meta[idx] = {"name": name, "ok": True, "duration": _dur}
+                        meta = f"[TOOL META] name={name} ok=true duration={_dur:.2f}s lines={num_lines} truncated={str(was_trunc).lower()} chars={min(self.cfg.tool_result_max_chars, total_len) if was_trunc else total_len}/{total_len}\n"
                         tool_results_msgs[idx] = {
                             "role": "tool",
                             "tool_call_id": tool_call_id,
                             "name": name,
-                            "content": content,
+                            "content": meta + (content_text or ""),
                         }
                     except asyncio.TimeoutError:
                         err = f"ERROR: tool '{name}' timed out after {TOOL_TIMEOUT_SEC}s."
@@ -502,9 +530,16 @@ class LLMOrchestrator:
                         await _body()
 
             tasks: List[asyncio.Task] = []
+            # 0 = serial, >0 = bounded concurrency, None = unlimited
             sem: Optional[asyncio.Semaphore] = None
-            if self.max_parallel_tools and self.max_parallel_tools > 0:
+            if self.max_parallel_tools is None:
+                sem = None
+            elif self.max_parallel_tools == 0:
+                sem = asyncio.Semaphore(1)
+            elif self.max_parallel_tools > 0:
                 sem = asyncio.Semaphore(self.max_parallel_tools)
+            else:
+                sem = None
 
             for idx, tc in enumerate(tool_calls):
                 name = tc.get("function", {}).get("name") or tc.get("name")
@@ -531,7 +566,13 @@ class LLMOrchestrator:
                 tasks.append(asyncio.create_task(_run_one(idx, name, args, tc.get("id", f"tc_{idx}"), sem)))
 
             if tasks:
-                await asyncio.gather(*tasks)
+                try:
+                    await asyncio.gather(*tasks)
+                except (asyncio.CancelledError, KeyboardInterrupt):
+                    for t in tasks:
+                        t.cancel()
+                    await asyncio.gather(*tasks, return_exceptions=True)
+                    raise
 
             async with self._print_lock:
                 for blk in result_blocks:
@@ -626,12 +667,6 @@ class LLMOrchestrator:
                 await asyncio.sleep(delay)
 
     def _manually_build_from_chunks(self, chunks: List[Any]) -> Dict[str, Any]:
-        """
-        (3) Tool-call assembly without brace hacks.
-        - Accumulate tool_calls by `index`.
-        - Concatenate `function.arguments` exactly as streamed.
-        - At the end, attempt a single JSON parse; if it fails, keep raw string.
-        """
         final_content: List[str] = []
         calls_by_index: Dict[int, Dict[str, Any]] = {}
         argbuf_by_index: Dict[int, List[str]] = {}
@@ -722,10 +757,6 @@ class LLMOrchestrator:
 
 
 def clamp_max_tokens_for_provider(model_name: str, requested: int) -> int:
-    """
-    (5) Conservative caps for common providers to avoid hard errors.
-    Groq models vary; we leave them as requested.
-    """
     provider, _ = _infer_provider_env_vars(model_name)
     # Very conservative defaults; adjust if you know your exact model limits.
     if provider in ("OpenAI", "Anthropic", "Gemini"):
@@ -763,7 +794,7 @@ async def amain(
     path_obj = pathlib.Path(config_path)
     print("=== LiteLLM MCP CLI Chat ===")
     print(f"Loading MCP configuration from: {path_obj}")
-    print("Type 'quit' to exit. Commands: /new, /history, /tools, /clean\n")
+    print("Type 'quit' to exit. Commands: /new, /history, /tools, /reload, /clean\n")
 
     if not path_obj.exists():
         print(f"[Fatal] Config file not found: {path_obj}")
@@ -893,6 +924,27 @@ async def amain(
                     tools = sorted(server_to_tools[sname])
                     print(f"  - {sname}: {tools}")
                 continue
+            if user == "/reload":
+                print("[Info] Reloading MCP servers and tools...")
+                try:
+                    await mcp.cleanup()
+                    mcp.load_config(path_obj)
+                    await mcp.start_all()
+                    tool_names = sorted(list(mcp.tool_to_server.keys()))
+                    print(f"✅ Reloaded. {len(mcp.servers)} server(s), {len(tool_names)} tool(s).")
+                    server_to_tools: Dict[str, List[str]] = {}
+                    for tname, srv in mcp.tool_to_server.items():
+                        sname = srv.name
+                        prefix = f"{sname}_"
+                        display = tname[len(prefix) :] if tname.startswith(prefix) else tname
+                        server_to_tools.setdefault(sname, []).append(display)
+                    for sname in sorted(server_to_tools.keys()):
+                        tools = sorted(server_to_tools[sname])
+                        print(f"  - {sname}: {tools}")
+                except Exception as e:
+                    logger.error("Reload failed: %r", e, exc_info=True)
+                    print(f"[Error] Reload failed: {e}")
+                continue
             if user == "/clean":
                 request_cleanup_data = True
                 print("[Info] Cleanup requested. Shutting down MCP servers… (may remove ./data)")
@@ -938,7 +990,7 @@ async def amain(
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Tiny MCP CLI Chat (supports /new, /history, /tools, /clean — note: /clean may remove ./data)"
+        description="Tiny MCP CLI Chat (supports /new, /history, /tools, /reload, /clean — note: /clean may remove ./data)"
     )
     parser.add_argument("--config", default=str(CONFIG_FILE), help="Path to mcp_config.json")
     parser.add_argument("--model", default=None, help="Model name (e.g., claude-3-7-sonnet-20250219)")
@@ -948,7 +1000,7 @@ def main():
     parser.add_argument("-q", dest="provider_groq", action="store_true", help="Use Groq default model")
     parser.add_argument("--max-tokens", type=int, default=None, help="Max tokens per response (may be capped safely per provider)")
     parser.add_argument("--max-tool-hops", type=int, default=None, help="Max tool-use hops per user turn")
-    parser.add_argument("--max-parallel-tools", type=int, default=DEFAULT_MAX_PARALLEL_TOOLS, help="Max parallel tool calls (0 = serial)")
+    parser.add_argument("--max-parallel-tools", type=int, default=DEFAULT_MAX_PARALLEL_TOOLS, help="Max parallel tool calls (0 = serial, None = unlimited)")
     parser.add_argument("--tool-preview-lines", type=int, default=DEFAULT_TOOL_PREVIEW_LINES, help="Print first N lines of each tool result")
     parser.add_argument("--tool-result-max-chars", type=int, default=None, help="Truncate tool results to this many chars")
     parser.add_argument("--tool-timeout-seconds", type=float, default=None, help="Per tool-call timeout in seconds")
