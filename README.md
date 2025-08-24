@@ -6,19 +6,12 @@ A minimal CLI that connects Anthropic's Messages API to one or more Model Contex
 - **MCP client**: Starts multiple MCP servers from `mcp_config.json`, lists tools, and routes calls.
 - **Claude streaming**: Streams assistant tokens live; shows tool requests as they occur.
 - **Multi-hop tool use**: Executes tool calls, returns results to the model, with retries and timeouts.
-- **History control**: Bounded message count and optional character cap.
 - **Simple UX**: Interactive REPL with `/new`, `/history`, and graceful cleanup.
 
 ### Requirements
 - **Python**: >= 3.13
 - **Anthropic API key**: set `ANTHROPIC_API_KEY` in your environment
 - Tools per your `mcp_config.json` (e.g., Node + npx for filesystem server, Docker for sqlite server)
-
-### Install
-Option A — uv (quick start):
-```powershell
-uv run tinyclient.py
-```
 
 ### Configure MCP servers
 Define MCP servers in `mcp_config.json`. By default, the script looks for this file next to `tinyclient.py` (override with `-c/--config`).
@@ -59,16 +52,16 @@ Run the CLI:
 ```powershell
 # Default: looks for mcp_config.json next to the script
 $env:ANTHROPIC_API_KEY = "sk-ant-..."
-python tinyclient.py
+uv run tinyclient.py
 
 # Or pass a custom file via -c/--config
-python tinyclient.py -c path\\to\\mcp_config.json
+uv run tinyclient.py -c path\\to\\mcp_config.json
 ```
 During a session:
 - Type your message and press Enter
 - `/new`: reset conversation
 - `/history`: print current conversation buffer
-- `/clean`: gracefully stop servers and delete the `data` directory (and the sqlite DB) next to the script
+- `/clean`: gracefully stop servers and delete the `data` directory (with the sqlite DB)
 - `quit` or `exit`: leave the program
 
 The CLI prints:
@@ -76,22 +69,31 @@ The CLI prints:
 - `→ Tool: <name> {args}` before execution
 - `← Result:` with the tool's normalized output (truncated to a safe length)
 
-### Tuning
-Edit constants in `tinyclient.py` if you want to change defaults:
-- `DEFAULT_MODEL`
-- `DEFAULT_MAX_TOKENS`
-- `DEFAULT_MAX_TOOL_HOPS`
-- `DEFAULT_TOOL_TIMEOUT_SEC`
-- `DEFAULT_LLM_RETRIES`
-- `DEFAULT_LLM_RETRY_BACKOFF_SEC`
-- `DEFAULT_TOOL_RESULT_MAX_CHARS`
+### CLI flags
+All defaults can be overridden at runtime via flags:
 
-History limits (in code defaults):
-- `DEFAULT_HISTORY_MAX_MESSAGES = 40`
-- `DEFAULT_HISTORY_MAX_CHARS = 0` (0 disables char cap)
+```powershell
+python tinyclient.py \
+  --model claude-3-5-sonnet-20241022 \
+  --max-tokens 1500 \
+  --max-tool-hops 10 \
+  --tool-result-max-chars 8000 \
+  --system-prompt "You are helpful." \
+  --system-prompt-file C:\\path\\to\\prompt.txt \
+  --no-prompt-txt \
+  --log-level INFO
+```
 
-System prompt:
-- The default `DEFAULT_SYSTEM_PROMPT` is a playful pirate persona. Edit `tinyclient.py` to change or clear it. For a neutral assistant, set it to an empty string.
+Notes:
+- Flags are optional; unspecified ones use compiled defaults.
+- `--no-prompt-txt` disables auto-loading `prompt.txt` next to the script.
+
+### System prompt
+- You can provide a system prompt inline with `--system-prompt` or via `--system-prompt-file`.
+- If no flag is provided and a `prompt.txt` file exists next to `tinyclient.py`, it will be used automatically.
+- If none of the above are provided, a compiled-in default will be used.
+
+Precedence (highest to lowest): `--system-prompt` > `--system-prompt-file` > `prompt.txt` (same folder) > default.
 
 ### How it works (high-level)
 - `MCPToolRouter` loads servers, aggregates tool schemas for Anthropic.
@@ -108,3 +110,5 @@ System prompt:
 
 ### License
 Not specified. Add a license if you plan to distribute.
+
+

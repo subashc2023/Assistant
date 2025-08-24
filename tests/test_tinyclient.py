@@ -179,35 +179,7 @@ class TestMCPToolRouter(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(router.namespaced_to_original["srvA_list"], "list")
 
 
-class TestHistoryTrimming(unittest.TestCase):
-
-    def test_trim_by_message_count_and_chars(self):
-        cfg = tc.AppConfig.defaults()
-        router = tc.MCPToolRouter()
-        orch = tc.AnthropicOrchestrator(cfg, router)
-        # 5 messages with varied content sizes
-        orch.conversation = [
-            {"role": "user", "content": "a"},
-            {"role": "assistant", "content": "b"},
-            {"role": "user", "content": "c"},
-            {"role": "assistant", "content": "d"},
-            {"role": "user", "content": "e"},
-        ]
-        orch.history_max_messages = 3
-        orch.history_max_chars = 3  # super small to force trimming to few messages
-        orch._trim_history()
-        # After trimming, at most 3 messages and also respects char cap
-        self.assertLessEqual(len(orch.conversation), 3)
-        def _size(m):
-            content = m.get("content", "")
-            if isinstance(content, str):
-                return len(content)
-            try:
-                return len(json.dumps(content))
-            except Exception:
-                return len(str(content))
-        total_chars = sum(_size(m) for m in orch.conversation)
-        self.assertLessEqual(total_chars, orch.history_max_chars)
+# History trimming removed from implementation; no tests required.
 
 
 class TestLoadConfig(unittest.TestCase):
@@ -343,15 +315,10 @@ class TestOrchestratorToolFlow(unittest.IsolatedAsyncioTestCase):
 
     async def test_tool_timeout_sets_error(self):
         cfg = tc.AppConfig.defaults()
-        cfg = tc.AppConfig(
-            model=cfg.model,
-            max_tokens=cfg.max_tokens,
-            max_tool_hops=cfg.max_tool_hops,
-            tool_timeout_sec=0.01,
-            llm_retries=cfg.llm_retries,
-            llm_retry_backoff_sec=cfg.llm_retry_backoff_sec,
-            tool_result_max_chars=cfg.tool_result_max_chars,
-        )
+        # Monkeypatch module-level timeout to a tiny value to force timeout
+        import tinyclient as _tc
+        old_timeout = getattr(_tc, "TOOL_TIMEOUT_SEC", 30.0)
+        _tc.TOOL_TIMEOUT_SEC = 0.01
         # Router simulates long-running tool
         router = self._Router(result_delay=0.05)
         orch = tc.AnthropicOrchestrator(cfg, router)
@@ -366,6 +333,8 @@ class TestOrchestratorToolFlow(unittest.IsolatedAsyncioTestCase):
         with contextlib.redirect_stdout(buf):
             await orch.run_single_turn("slow tool")
         self.assertIn("timed out", buf.getvalue())
+        # restore timeout
+        _tc.TOOL_TIMEOUT_SEC = old_timeout
 
 
 if __name__ == "__main__":
