@@ -47,30 +47,30 @@ pip install uv
 # Configure API Keys
 ## Example 
 
-(PowerShell - temporary):
+PowerShell (temporary):
 ```
 $env:<PROVIDER>_API_KEY = "<API_KEY>"
 ```
-(PowerShell - persistent):
+PowerShell (persistent):
 ```
 Add-Content $PROFILE '$env:VARIABLE_NAME = "value"'
 . $PROFILE #to reload shell
 ```
 
-(CMD - temporary):
+CMD (temporary):
 ```
 set <PROVIDER>_API_KEY = <API_KEY>
 ```
-(CMD - persistent):
+CMD (persistent):
 ```
 setx <PROVIDER>_API_KEY <API_KEY>  #not reflected in current prompt
 ```
 
-(BASH - temporary):
+BASH (temporary):
 ```
 export <PROVIDER>_API_KEY = <API_KEY>
 ```
-(BASH - persistent):
+BASH (persistent):
 ```
 echo 'export <PROVIDER>_API_KEY=<API_KEY>' >> ~/.bashrc
 source ~/.bashrc
@@ -85,7 +85,7 @@ uv run client.py --config mcp_config.json --model openai/gpt-4o-mini
 
 
 Configure MCP servers
-Ensure `mcp_config.json` exists in the repo root (a starter is provided):
+Ensure `mcp_config.json` exists in the repo root (a starter is already provided):
 ```json
 {
   "mcpServers": {
@@ -105,8 +105,6 @@ Ensure `mcp_config.json` exists in the repo root (a starter is provided):
   }
 }
 ```
-
-
 
 You should see something like:
 ```
