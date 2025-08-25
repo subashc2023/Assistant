@@ -30,25 +30,59 @@ Prereqs
   - Node.js (for `npx @modelcontextprotocol/server-filesystem`)
   - Docker (for the sample SQLite MCP container)
 
-Install uv with 
-``` Windows
+# Install uv with 
+Windows
+``` 
 powershell -ExecutionPolicy ByPass -c "irm https://astral.sh/uv/install.ps1 | iex"
 ```
-```unix - Use wget or curl
+unix - Use wget or curl
+```
 < wget -q0- > or < curl -LsSf > https://astral.sh/uv/install.sh | sh
 ```
-
-Configure providers
-- OpenAI: set `OPENAI_API_KEY`
-- Anthropic: set `ANTHROPIC_API_KEY`
-- Gemini: set `GEMINI_API_KEY` or `GOOGLE_API_KEY`
-- Groq: set `GROQ_API_KEY`
-
-Example (PowerShell):
+or if you already have pip/python
 ```
-$env:OPENAI_API_KEY = "sk-..."
-$env:GROQ_API_KEY = "gsk_..."
+pip install uv
 ```
+
+# Configure API Keys
+## Example 
+
+(PowerShell - temporary):
+```
+$env:<PROVIDER>_API_KEY = "<API_KEY>"
+```
+(PowerShell - persistent):
+```
+Add-Content $PROFILE '$env:VARIABLE_NAME = "value"'
+. $PROFILE #to reload shell
+```
+
+(CMD - temporary):
+```
+set <PROVIDER>_API_KEY = <API_KEY>
+```
+(CMD - persistent):
+```
+setx <PROVIDER>_API_KEY <API_KEY>  #not reflected in current prompt
+```
+
+(BASH - temporary):
+```
+export <PROVIDER>_API_KEY = <API_KEY>
+```
+(BASH - persistent):
+```
+echo 'export <PROVIDER>_API_KEY=<API_KEY>' >> ~/.bashrc
+source ~/.bashrc
+```
+
+# Run
+```
+uv run client.py                                # Default model
+uv run client.py -o                             # OpenAI default model
+uv run client.py --config mcp_config.json --model openai/gpt-4o-mini 
+```
+
 
 Configure MCP servers
 Ensure `mcp_config.json` exists in the repo root (a starter is provided):
@@ -72,12 +106,7 @@ Ensure `mcp_config.json` exists in the repo root (a starter is provided):
 }
 ```
 
-Run
-```
-uv run client.py                                # Default model
-uv run client.py -o                             # OpenAI default model
-uv run client.py --config mcp_config.json --model openai/gpt-4o-mini 
-```
+
 
 You should see something like:
 ```
