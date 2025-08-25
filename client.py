@@ -612,9 +612,6 @@ class LLMOrchestrator:
             callbacks = [callbacks] if callbacks else []
         callbacks.append(callback)
         litellm.success_callback = callbacks
-
-        if hasattr(self.config, 'model_aliases') and self.config.model_aliases:
-            litellm.model_alias_map = dict(self.config.model_aliases)
     
     async def run_turn(self, user_input: str) -> str:
         self.conversation.append({"role": "user", "content": user_input})
@@ -792,15 +789,18 @@ class CommandHandler:
                     for alias, full in sorted(alias_map.items()):
                         print(f"  {alias} -> {full}")
             else:
+                # Just set the model directly - LiteLLM will resolve aliases
                 model = args
+                # For auth checking, we need to resolve the alias to check the right provider
                 alias_map = getattr(litellm, 'model_alias_map', {}) or {}
                 effective_model = alias_map.get(model, model)
                 ok, missing = check_provider_auth(effective_model)
                 if not ok:
                     print(f"[Error] Missing API keys: {', '.join(missing)}")
                 else:
-                    self.config.model = model
-                    self.config.max_tokens = self.config._apply_token_cap(model, self.config.max_tokens)
+                    self.config.model = model  # Store the alias/model as-is
+                    # Apply token cap based on resolved model
+                    self.config.max_tokens = self.config._apply_token_cap(effective_model, self.config.max_tokens)
                     print(f"[Info] Switched to {model}")
         
         elif command == '/reload':
@@ -848,9 +848,15 @@ async def amain(args: argparse.Namespace) -> None:
     config = AppConfig.load(cli_args=cli_args)
     configure_logging(config)
     
+    # Set model alias map immediately after loading config
+    # This ensures LiteLLM will resolve aliases in all subsequent calls
+    if hasattr(config, 'model_aliases') and config.model_aliases:
+        litellm.model_alias_map = dict(config.model_aliases)
+    
     # Create theme based on config
     theme = create_theme(config)
 
+    # Check auth using the model (LiteLLM will resolve alias if needed)
     ok, missing = check_provider_auth(config.model)
     if not ok:
         print(f"[Fatal] Missing API credentials: {', '.join(missing)}")
