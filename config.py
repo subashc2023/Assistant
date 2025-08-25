@@ -3,6 +3,7 @@ import os
 import pathlib
 from dataclasses import dataclass, field
 from typing import Dict, Any, Optional, List, Tuple
+import litellm
 
 DEFAULTS = {
     'openai': 'openai/gpt-4.1-mini',
@@ -39,6 +40,31 @@ PROVIDERS = {
 }
 
 
+# Built-in model aliases (alias -> litellm model name)
+MODEL_ALIASES: Dict[str, str] = {
+    # Groq
+    'llamaS': 'groq/llama-3.1-8b-instant',
+    'llamaL': 'groq/llama-3.3-70b-versatile',
+    'oss': 'groq/openai/gpt-oss-120b',
+
+    # Anthropic
+    'haiku': 'anthropic/claude-3-5-haiku-latest',
+    'sonnet': 'anthropic/claude-3-7-sonnet-20250219',
+    'opus': 'anthropic/claude-3-opus-20240229',
+
+    # OpenAI
+    '4o': 'openai/gpt-4o',
+    '4omini': 'openai/gpt-4o-mini',
+    '4.1': 'openai/gpt-4.1',
+    '4.1mini': 'openai/gpt-4.1-mini',
+
+    # Gemini
+    'flash': 'gemini/gemini-2.5-flash',
+    'pro': 'gemini/gemini-2.5-pro',
+    'lite': 'gemini/gemini-2.5-lite',
+}
+
+
 @dataclass
 class AppConfig:
 
@@ -56,7 +82,7 @@ class AppConfig:
     log_json: bool = False
     use_color: bool = True
 
-    model_aliases: Dict[str, str] = field(default_factory=dict)
+    model_aliases: Dict[str, str] = field(default_factory=lambda: dict(MODEL_ALIASES))
     
     @classmethod
     def load(cls, 
@@ -68,8 +94,8 @@ class AppConfig:
                 config.model = DEFAULTS.get(cli_args['provider'], config.model)
 
             if cli_args.get('model'):
-                model = cli_args['model']
-                config.model = config.model_aliases.get(model, model)
+                # Do not apply internal aliasing here; LiteLLM will handle aliases via litellm.model_alias_map
+                config.model = cli_args['model']
 
             if cli_args.get('system_prompt_file'):
                 prompt_path = pathlib.Path(cli_args['system_prompt_file'])
@@ -92,12 +118,19 @@ class AppConfig:
             if (('use_color' not in cli_args) or (cli_args.get('use_color') is None)) and os.getenv('NO_COLOR'):
                 config.use_color = False
 
+        # Expose aliases to LiteLLM and apply token caps using resolved model
+        try:
+            litellm.model_alias_map = dict(config.model_aliases)
+        except Exception:
+            pass
+
         config.max_tokens = config._apply_token_cap(config.model, config.max_tokens)
         
         return config
     
     def _apply_token_cap(self, model: str, requested_tokens: int) -> int:
-        provider = detect_provider(model)
+        effective_model = self.model_aliases.get(model, model)
+        provider = detect_provider(effective_model)
         if provider and provider in PROVIDERS:
             cap = PROVIDERS[provider].get('max_tokens_cap')
             if cap and requested_tokens > cap:

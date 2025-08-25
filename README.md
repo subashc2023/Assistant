@@ -1,13 +1,14 @@
 Assistant (LiteLLM + MCP CLI)
 ================================
 
-Minimal, fast CLI that streams responses from an LLM (via LiteLLM) and executes Model Context Protocol (MCP) tools over stdio. It auto-discovers tools from configured MCP servers and exposes them to the model as OpenAI-style function tools. Built for reliability: parallel tool calls, timeouts, truncation, and duplicate-call prevention.
+Minimal, fast CLI that streams responses from an LLM (via LiteLLM) and executes Model Context Protocol (MCP) tools over stdio. It auto-discovers tools from configured MCP servers and exposes them to the model as OpenAI-style function tools. Built for reliability: parallel tool calls, timeouts, and result truncation.
 
 Why this exists
 ----------------
 - Simple: a single Python script wired to LiteLLM and MCP
 - Productive: live streaming output, tooling discovery, and batch tool execution
 - Practical: provider auto-detect, token caps, structured tool results, and sane defaults
+- Efficient: Starts MCP Server Docker Containers, and automatically cleans up on quit/termination
 
 Features
 --------
@@ -16,9 +17,9 @@ Features
 - Namespaced tool exposure to the LLM (e.g., `filesystem_readFile`)
 - Parallel tool execution with semaphore control and per-call timeout
 - Tool result truncation and preview printing
-- Duplicate tool-call prevention per batch
 - Provider detection (OpenAI, Anthropic, Gemini, Groq) and `max_tokens` capping
 - Basic usage metrics (tokens and total cost if available)
+- Executes duplicate tool calls when requested (no dedup) — supports non-idempotent tools
 
 Quickstart
 ----------
@@ -111,7 +112,7 @@ You should see something like:
 === LiteLLM MCP CLI Chat ===
 Model: groq/llama-3.3-70b-versatile
 Config: mcp_config.json
-Type 'quit' to exit. Commands: /new, /history, /tools, /model, /reload
+Type '/quit' or '/exit' to exit. Commands: /new, /history, /tools, /model, /reload
 ✅ Connected: 2 servers, N tools
   - filesystem: [...]
   - sqlite: [...]
@@ -128,7 +129,7 @@ Commands
 - `/new` reset the conversation
 - `/history` print conversation JSON
 - `/tools` list discovered tools per MCP server
-- `/model` show current model and (if configured) aliases
+- `/model` show current model and aliases
 - `/model <alias|full>` switch model (env must be set for that provider)
 - `/reload` reconnect to MCP servers and rebuild tool list
 - `/quit` or `/exit` exit
@@ -151,6 +152,43 @@ uv run client.py --help
 --log-level LEVEL                DEBUG|INFO|WARNING|ERROR
 --log-json                       (reserved) emit JSON logs (see roadmap)
 ```
+
+Built-in model aliases
+----------------------
+Aliases are built-in and loaded into LiteLLM automatically. Use `/model <alias>` to switch.
+
+Groq:
+```
+llamaS -> groq/llama-3.1-8b-instant
+llamaL -> groq/llama-3.3-70b-versatile
+oss    -> groq/openai/gpt-oss-120b
+```
+
+Anthropic:
+```
+haiku  -> anthropic/claude-3-5-haiku-latest
+sonnet -> anthropic/claude-3-7-sonnet-20250219
+opus   -> anthropic/claude-3-opus-20240229
+```
+
+OpenAI:
+```
+4o      -> openai/gpt-4o
+4omini  -> openai/gpt-4o-mini
+4.1     -> openai/gpt-4.1
+4.1mini -> openai/gpt-4.1-mini
+```
+
+Gemini:
+```
+flash -> gemini/gemini-2.5-flash
+pro   -> gemini/gemini-2.5-pro
+lite  -> gemini/gemini-2.5-lite
+```
+
+Notes:
+- Provider auth and token caps are validated against the resolved target model.
+- `/model` without args lists the current model and all aliases.
 
 Configuration details
 ---------------------

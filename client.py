@@ -340,12 +340,11 @@ class ToolExecutor:
     def __init__(self, router: MCPRouter, config: AppConfig):
         self.router = router
         self.config = config
-        self.seen_calls: set = set()
+        # No deduplication: always execute tool calls as received
     
     async def execute_batch(self, tool_calls: List[Dict]) -> List[ToolResult]:
         results = []
         tasks = []
-        self.seen_calls.clear()
 
         sem = None
         if self.config.max_parallel_tools > 0:
@@ -355,19 +354,6 @@ class ToolExecutor:
             name = tc.get("function", {}).get("name", "")
             args_str = tc.get("function", {}).get("arguments", "{}")
             tool_call_id = tc.get("id", f"tc_{len(tasks)}")
-
-            call_key = (name, args_str)
-            if call_key in self.seen_calls:
-                results.append(ToolResult(
-                    name=name,
-                    tool_call_id=tool_call_id,
-                    content="ERROR: Duplicate tool call prevented",
-                    success=False,
-                    duration=0.0
-                ))
-                continue
-            
-            self.seen_calls.add(call_key)
             tasks.append(self._execute_single(name, args_str, tool_call_id, sem))
 
         if tasks:
@@ -595,6 +581,14 @@ class LLMOrchestrator:
             litellm.success_callback = callbacks
         except Exception:
             pass
+
+        # Ensure LiteLLM sees any configured alias map on the config, if present
+        try:
+            if hasattr(self.config, 'model_aliases') and self.config.model_aliases:
+                # Delegate aliasing to LiteLLM
+                setattr(litellm, 'model_alias_map', dict(self.config.model_aliases))
+        except Exception:
+            pass
     
     async def run_turn(self, user_input: str) -> str:
         self.conversation.append({"role": "user", "content": user_input})
@@ -762,13 +756,21 @@ class CommandHandler:
         elif command == '/model':
             if not args:
                 print(f"Current model: {self.config.model}")
-                if self.config.model_aliases:
-                    print("Available aliases:")
-                    for alias, full in sorted(self.config.model_aliases.items()):
-                        print(f"  {alias} -> {full}")
+                try:
+                    alias_map = getattr(litellm, 'model_alias_map', {}) or {}
+                    if alias_map:
+                        print("Available aliases:")
+                        for alias, full in sorted(alias_map.items()):
+                            print(f"  {alias} -> {full}")
+                except Exception:
+                    pass
             else:
-                model = self.config.model_aliases.get(args, args)
-                ok, missing = check_provider_auth(model)
+                # Let LiteLLM resolve aliases via litellm.model_alias_map; store as given
+                model = args
+                # For auth + caps, check using the resolved target if alias exists
+                alias_map = getattr(litellm, 'model_alias_map', {}) or {}
+                effective_model = alias_map.get(model, model)
+                ok, missing = check_provider_auth(effective_model)
                 if not ok:
                     print(f"[Error] Missing API keys: {', '.join(missing)}")
                 else:
@@ -834,6 +836,8 @@ async def amain(args: argparse.Namespace) -> None:
     except Exception:
         THEME.enabled = False
 
+    # Alias map is provided by config.py (AppConfig.load sets litellm.model_alias_map)
+
     ok, missing = check_provider_auth(config.model)
     if not ok:
         print(f"[Fatal] Missing API credentials: {', '.join(missing)}")
@@ -842,7 +846,7 @@ async def amain(args: argparse.Namespace) -> None:
     print(THEME.sep("LiteLLM MCP CLI Chat"))
     print(f"{THEME.label('[Model]', 'magenta')} {config.model}")
     print(f"{THEME.label('[Config]', 'magenta')} {args.config}")
-    print(THEME.gray("Type 'quit' to exit. Commands: /new, /history, /tools, /model, /reload"))
+    print(THEME.gray("Type '/quit' or '/exit' to exit. Commands: /new, /history, /tools, /model, /reload, /quit"))
 
     config_path = pathlib.Path(args.config)
     if not config_path.exists():
