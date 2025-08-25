@@ -40,25 +40,25 @@ PROVIDERS = {
 }
 
 
-# Built-in model aliases (alias -> litellm model name)
+
 MODEL_ALIASES: Dict[str, str] = {
-    # Groq
+
     'llamaS': 'groq/llama-3.1-8b-instant',
     'llamaL': 'groq/llama-3.3-70b-versatile',
     'oss': 'groq/openai/gpt-oss-120b',
 
-    # Anthropic
+
     'haiku': 'anthropic/claude-3-5-haiku-latest',
     'sonnet': 'anthropic/claude-3-7-sonnet-20250219',
     'opus': 'anthropic/claude-3-opus-20240229',
 
-    # OpenAI
+
     '4o': 'openai/gpt-4o',
     '4omini': 'openai/gpt-4o-mini',
     '4.1': 'openai/gpt-4.1',
     '4.1mini': 'openai/gpt-4.1-mini',
 
-    # Gemini
+
     'flash': 'gemini/gemini-2.5-flash',
     'pro': 'gemini/gemini-2.5-pro',
     'lite': 'gemini/gemini-2.5-lite',
@@ -118,7 +118,7 @@ class AppConfig:
             if (('use_color' not in cli_args) or (cli_args.get('use_color') is None)) and os.getenv('NO_COLOR'):
                 config.use_color = False
 
-        # Expose aliases to LiteLLM and apply token caps using resolved model
+
         try:
             litellm.model_alias_map = dict(config.model_aliases)
         except Exception:

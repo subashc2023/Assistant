@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 # /// script
 # requires-python = ">=3.13"
 # dependencies = [
@@ -99,6 +98,12 @@ class AnsiTheme:
         return self.gray(char * width)
 
 THEME = AnsiTheme(enabled=True)
+
+def _strip_ansi(text: str) -> str:
+    try:
+        return re.sub(r"\x1b\[[0-9;]*[A-Za-z]", "", text)
+    except Exception:
+        return text
 
 def _short_exception(exc: BaseException, limit: int = 160) -> str:
     try:
@@ -219,9 +224,19 @@ class MCPRouter:
             config = json.load(f)
         
         raw_servers = config.get("mcpServers", {})
-        if not isinstance(raw_servers, dict) or not raw_servers:
-            raise ValueError("mcp_config.json must contain 'mcpServers' object")
-        
+        if not isinstance(raw_servers, dict):
+            raise ValueError("mcp_config.json must contain 'mcpServers' object (dict) if present")
+
+
+        discovered = self._discover_local_servers(config_path)
+
+        for name, cfg in discovered.items():
+            if name not in raw_servers:
+                raw_servers[name] = cfg
+
+        if not raw_servers:
+            raise ValueError("No MCP servers found (neither in mcp_config.json nor in ./servers)")
+
         self.servers = [MCPServer(name, cfg) for name, cfg in raw_servers.items()]
 
         self.tool_specs.clear()
@@ -314,6 +329,57 @@ class MCPRouter:
             result.setdefault(server.name, []).append(display)
         return result
 
+    def _discover_local_servers(self, config_path: pathlib.Path) -> Dict[str, Dict[str, Any]]:
+        servers: Dict[str, Dict[str, Any]] = {}
+
+        candidates: List[pathlib.Path] = []
+        try:
+            cfg_dir = config_path.parent
+            candidates.append(cfg_dir / "servers")
+        except Exception:
+            pass
+        try:
+            candidates.append(SCRIPT_DIR / "servers")
+        except Exception:
+            pass
+
+
+        seen: set = set()
+        unique_dirs: List[pathlib.Path] = []
+        for d in candidates:
+            try:
+                rp = d.resolve()
+            except Exception:
+                rp = d
+            if rp in seen:
+                continue
+            seen.add(rp)
+            unique_dirs.append(d)
+
+        for root in unique_dirs:
+            try:
+                if not root.exists() or not root.is_dir():
+                    continue
+                for py in root.glob("*.py"):
+                    if py.name == "__init__.py" or py.name.startswith("._") or py.name.startswith("~"):
+                        continue
+                    name = py.stem
+                    try:
+                        cmd = sys.executable or "python"
+                    except Exception:
+                        cmd = "python"
+                    servers.setdefault(name, {
+                        "command": cmd,
+                        "args": [str(py.resolve())],
+                        # inherit environment
+                    })
+            except Exception as e:
+                logger.debug("Local server discovery error in %s: %r", str(root), e)
+
+        if servers:
+            logger.info("Discovered %d local MCP servers in ./servers", len(servers))
+        return servers
+
 @dataclass
 class ToolResult:
     name: str
@@ -341,7 +407,7 @@ class ToolExecutor:
     def __init__(self, router: MCPRouter, config: AppConfig):
         self.router = router
         self.config = config
-        # No deduplication: always execute tool calls as received
+
     
     async def execute_batch(self, tool_calls: List[Dict]) -> List[ToolResult]:
         results = []
@@ -367,10 +433,15 @@ class ToolExecutor:
         
         return results
     
-    async def _execute_single(self, name: str, args_str: str,
+    async def _execute_single(self, name: str, args_str: Any,
                              tool_call_id: str, sem: Optional[asyncio.Semaphore]) -> ToolResult:
-        try:# Some providers send already-serialized JSON strings; try parse, else treat as raw string.
-            args = json.loads(args_str) if (isinstance(args_str, str) and args_str.strip()) else {}
+        try:# Some providers send already-serialized JSON strings; try parse; accept dict directly.
+            if isinstance(args_str, str):
+                args = json.loads(args_str) if args_str.strip() else {}
+            elif isinstance(args_str, dict):
+                args = args_str
+            else:
+                args = {}
         except json.JSONDecodeError:
             return ToolResult(
                 name=name,
@@ -539,7 +610,7 @@ class StreamParser:
             'content': ''.join(self.content_buffer).strip() or None
         }
 
-        # Add tool calls if any were parsed
+
         if self.tool_calls:
             tool_calls = []
             next_id_suffix = 0
@@ -582,19 +653,12 @@ class StreamParser:
         return message
 
     def _split_concatenated_json_objects(self, text: str) -> List[str]:
-        """
-        Best-effort splitter for cases where multiple JSON objects are concatenated
-        without separators, e.g. "{...}{...}{...}". If the input parses as a single
-        JSON object or empty/invalid, fall back to returning the original string.
 
-        This is needed because some providers (notably Gemini via various SDK layers)
-        may stream tool-call argument objects as adjacent JSON without commas.
-        """
         s = (text or '').strip()
         if not s:
             return [text or '']
 
-        # Fast path: if it looks like a single object and is valid JSON, return as-is
+
         if s.startswith('{') and s.endswith('}'):
             try:
                 json.loads(s)
@@ -602,7 +666,7 @@ class StreamParser:
             except Exception:
                 pass
 
-        # Scan and split on balanced top-level braces, respecting strings
+
         parts: List[str] = []
         depth = 0
         start_idx = None
@@ -637,14 +701,14 @@ class StreamParser:
                         parts.append(candidate)
                         start_idx = None
                     except Exception:
-                        # fall through; we'll bail out below
+
                         pass
 
-        # If we found multiple valid objects, return them
+
         if len(parts) > 1:
             return parts
 
-        # Otherwise, return original text
+
         return [text]
 
 
@@ -680,7 +744,7 @@ class LLMOrchestrator:
         except Exception:
             pass
 
-        # Handle model aliases if configured
+
         try:
             if hasattr(self.config, 'model_aliases') and self.config.model_aliases:
                 setattr(litellm, 'model_alias_map', dict(self.config.model_aliases))
@@ -692,9 +756,10 @@ class LLMOrchestrator:
 
         final_response = []
         tool_cycles = 0
+        tool_calls: Optional[List[Dict[str, Any]]] = None
 
         while tool_cycles < self.config.max_tool_hops:
-            show_header = (tool_cycles == 0)
+            show_header = True
             assistant_msg = await self._call_llm_streaming(show_header)
 
             # Always collect the assistant's content
@@ -743,12 +808,11 @@ class LLMOrchestrator:
             for result in results_sorted:
                 self.conversation.append(result.to_message())
 
-            print("\n" + THEME.label("[Assistant]", "cyan"), end=" ", flush=True)
             tool_cycles += 1
 
-        # If we hit the tool hop limit, get a final response without tools
+
         if tool_cycles >= self.config.max_tool_hops and tool_calls:
-            final_msg = await self._call_llm_streaming(False, allow_tools=False)
+            final_msg = await self._call_llm_streaming(True, allow_tools=False)
             if final_msg.get("content"):
                 final_response.append(final_msg["content"])
                 self.conversation.append({"role": "assistant", "content": final_msg["content"]})
@@ -787,6 +851,9 @@ class LLMOrchestrator:
         parser = StreamParser()
         stream = await litellm.acompletion(**kwargs)
         header_shown = False
+        label = THEME.label("[Assistant]", "cyan") + " "
+        plain_label = _strip_ansi(label)
+        indent = " " * len(plain_label)
 
         try:
             async for chunk in stream:
@@ -795,14 +862,22 @@ class LLMOrchestrator:
                 # Always show content to user as it streams
                 if content:
                     if show_header and not header_shown:
-                        print("\n" + THEME.label("[Assistant]", "cyan"), end=" ", flush=True)
+                        print("\n" + label, end="", flush=True)
                         header_shown = True
-                    print(content, end="", flush=True)
+                    # Apply hanging indent to multi-line chunks
+                    if "\n" in content:
+                        lines = content.splitlines(True)
+                        if lines:
+                            print(lines[0], end="", flush=True)
+                            for seg in lines[1:]:
+                                print("\n" + indent + seg.lstrip("\n"), end="", flush=True)
+                    else:
+                        print(content, end="", flush=True)
 
             # Add a newline after streaming content (if any content was shown)
             if header_shown or (show_header and parser.content_buffer):
                 if not header_shown and show_header:
-                    print("\n" + THEME.label("[Assistant]", "cyan"), end=" ", flush=True)
+                    print("\n" + label, end="", flush=True)
                 print(flush=True)
                 
         finally:
@@ -940,7 +1015,7 @@ async def amain(args: argparse.Namespace) -> None:
     except Exception:
         THEME.enabled = False
 
-    # Alias map is provided by config.py (AppConfig.load sets litellm.model_alias_map)
+
 
     ok, missing = check_provider_auth(config.model)
     if not ok:
