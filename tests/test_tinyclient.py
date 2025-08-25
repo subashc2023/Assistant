@@ -8,7 +8,6 @@ import contextlib
 import unittest
 import types as _types
 
-# Provide minimal fakes for external deps so importing tinyclient doesn't require them.
 if "litellm" not in sys.modules:
     litellm = _types.ModuleType("litellm")
     async def _acompletion(**_kwargs):
@@ -73,12 +72,11 @@ if "mcp" not in sys.modules:
     sys.modules["mcp.client"] = mcp_client
     sys.modules["mcp.client.stdio"] = mcp_client_stdio
 
-# Ensure repo root import when running this test file directly
 _REPO_ROOT = pathlib.Path(__file__).resolve().parents[1]
 if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
-import tinyclient as tc
+import client as tc
 
 
 class TestResolveCommand(unittest.TestCase):
@@ -124,19 +122,18 @@ class TestFormatToolResultForLLM(unittest.TestCase):
             self._Blob({"k": "v"}),
             self._Text("world"),
         ])
-        out = tc.format_tool_result_for_llm(res, max_chars=1000)
-        self.assertIn("hello", out)
-        self.assertIn("world", out)
-        # pretty_json uses indentation, so check keys separately
-        self.assertIn("\"blob\"", out)
-        self.assertIn("\"k\": \"v\"", out)
+        text, was_trunc, total = tc.format_tool_result_for_llm(res, max_chars=1000)
+        self.assertIn("hello", text)
+        self.assertIn("world", text)
+        self.assertIn("\"blob\"", text)
+        self.assertIn("\"k\": \"v\"", text)
 
     def test_truncation(self):
         long_text = "x" * 500
         res = self._Result([self._Text(long_text)])
-        out = tc.format_tool_result_for_llm(res, max_chars=100)
-        self.assertTrue(len(out) <= 100 + len("\n… [truncated]"))
-        self.assertTrue(out.endswith("… [truncated]"))
+        text, was_trunc, total = tc.format_tool_result_for_llm(res, max_chars=100)
+        self.assertTrue(len(text) <= 100)
+        self.assertTrue(was_trunc)
 
 
 class TestUIToolPrinting(unittest.TestCase):
@@ -183,37 +180,25 @@ class TestMCPToolRouter(unittest.IsolatedAsyncioTestCase):
 
     async def test_start_all_namespacing_and_registry(self):
         router = tc.MCPToolRouter()
-        # Inject fake servers directly
         router.servers = [self._FakeServer("srvA"), self._FakeServer("srvB")]
         await router.start_all()
-        # Expect 3 tools per server, 6 total entries with namespaced keys
         self.assertEqual(len(router.openai_tool_specs), 6)
-        # Names should be unique even with duplicates (list, list_2)
         names = {spec["function"]["name"] for spec in router.openai_tool_specs}
-        # Expect two entries from srvA named srvA_list and srvA_list_2
         self.assertIn("srvA_list", names)
         self.assertIn("srvA_list_2", names)
         self.assertIn("srvA_info", names)
-        # Mappings should route to the right server
         self.assertIs(router.tool_to_server["srvA_list"], router.servers[0])
         self.assertEqual(router.namespaced_to_original["srvA_list"], "list")
-
-
-# History trimming removed from implementation; no tests required.
-
 
 class TestLoadConfig(unittest.TestCase):
 
     def test_load_config_validates_mcpServers(self):
         router = tc.MCPToolRouter()
-        # Missing mcpServers
         with tempfile.TemporaryDirectory() as tmpdir:
             p = pathlib.Path(tmpdir) / "cfg.json"
             p.write_text("{}", encoding="utf-8")
             with self.assertRaises(ValueError):
                 router.load_config(p)
-
-        # Minimal valid config
         with tempfile.TemporaryDirectory() as tmpdir:
             p = pathlib.Path(tmpdir) / "cfg.json"
             cfg = {
@@ -243,7 +228,6 @@ class TestRouterCallRouting(unittest.IsolatedAsyncioTestCase):
     async def test_routing_to_original_tool_name(self):
         router = tc.MCPToolRouter()
         srv = self._Srv("alpha")
-        # Inject mapping directly
         router.tool_to_server = {"alpha_list": srv}
         router.namespaced_to_original = {"alpha_list": "list"}
         res = await router.call_tool("alpha_list", {"k": 1})
@@ -300,7 +284,9 @@ class TestOrchestratorToolFlow(unittest.IsolatedAsyncioTestCase):
                 return {"content": "done"}
 
         orch._call_llm_streaming = _fake_stream  # type: ignore
-        out = await orch.run_single_turn("list please")
+        cap = io.StringIO()
+        with contextlib.redirect_stdout(cap):
+            out = await orch.run_single_turn("list please")
         self.assertIn("working", out)
         self.assertIn("done", out)
         self.assertEqual(len(router.calls), 1)
@@ -308,7 +294,13 @@ class TestOrchestratorToolFlow(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(router.calls[0][1], {"path": "/"})
 
     async def test_duplicate_tool_calls_blocked(self):
-        cfg = tc.AppConfig.defaults()
+        cfg0 = tc.AppConfig.defaults()
+        cfg = tc.AppConfig(
+            model=cfg0.model,
+            max_tokens=cfg0.max_tokens,
+            max_tool_hops=1,
+            tool_result_max_chars=cfg0.tool_result_max_chars,
+        )
         router = self._Router()
         orch = tc.LLMOrchestrator(cfg, router)
 
@@ -322,22 +314,23 @@ class TestOrchestratorToolFlow(unittest.IsolatedAsyncioTestCase):
             }
 
         orch._call_llm_streaming = _fake_stream  # type: ignore
-        # Capture stdout to check printed error
         buf = io.StringIO()
         with contextlib.redirect_stdout(buf):
             await orch.run_single_turn("run twice")
-        # Only one actual router call
         self.assertEqual(len(router.calls), 1)
-        # Error message present
         self.assertIn("repeated identical tool call prevented", buf.getvalue())
 
     async def test_tool_timeout_sets_error(self):
-        cfg = tc.AppConfig.defaults()
-        # Monkeypatch module-level timeout to a tiny value to force timeout
-        import tinyclient as _tc
+        cfg0 = tc.AppConfig.defaults()
+        cfg = tc.AppConfig(
+            model=cfg0.model,
+            max_tokens=cfg0.max_tokens,
+            max_tool_hops=1,
+            tool_result_max_chars=cfg0.tool_result_max_chars,
+        )
+        import client as _tc
         old_timeout = getattr(_tc, "TOOL_TIMEOUT_SEC", 30.0)
         _tc.TOOL_TIMEOUT_SEC = 0.01
-        # Router simulates long-running tool
         router = self._Router(result_delay=0.05)
         orch = tc.LLMOrchestrator(cfg, router)
 
@@ -351,10 +344,10 @@ class TestOrchestratorToolFlow(unittest.IsolatedAsyncioTestCase):
 
         orch._call_llm_streaming = _fake_stream  # type: ignore
         buf = io.StringIO()
-        with contextlib.redirect_stdout(buf):
+        err_buf = io.StringIO()
+        with contextlib.redirect_stdout(buf), contextlib.redirect_stderr(err_buf):
             await orch.run_single_turn("slow tool")
         self.assertIn("timed out", buf.getvalue())
-        # restore timeout
         _tc.TOOL_TIMEOUT_SEC = old_timeout
 
 

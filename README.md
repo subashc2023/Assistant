@@ -1,155 +1,161 @@
-### LiteLLM MCP CLI Chat (tinyclient)
+## tinyclient — MCP x LiteLLM single-file chat
 
-A minimal CLI that connects LiteLLM's OpenAI-compatible chat API to one or more Model Context Protocol (MCP) servers over stdio. It aggregates tools exposed by MCP servers, namespaces them, and routes tool calls during a streamed conversation.
+Tiny, battery-included REPL that connects LiteLLM to one or more MCP servers over stdio. It lists tools, namespaces them by server, streams assistant output, and executes tool calls with retries, timeouts, and bounded parallelism.
 
-### Features
-- **MCP client**: Starts multiple MCP servers from `mcp_config.json`, lists tools, and routes calls.
-- **Streaming**: Streams assistant tokens live; shows tool requests as they occur.
-- **Multi-hop tool use**: Executes tool calls, returns results to the model, with retries and timeouts.
-- **Simple UX**: Interactive REPL with `/new`, `/history`, and graceful cleanup.
+### Why you might want this
+- **One file**: drop `tinyclient.py` anywhere, no framework.
+- **Real tools**: speak MCP; run any stdio MCP server you point at.
+- **Great UX**: streaming tokens, live tool call logs, `/reload` without restart.
 
 ### Requirements
-- **Python**: >= 3.13
-- **Provider API key(s)**: e.g., set `OPENAI_API_KEY` (LiteLLM reads common provider keys)
-- Tools per your `mcp_config.json` (e.g., Node + npx for filesystem server, Docker for sqlite server)
+- **Python**: 3.10+ (developed and tested on 3.13)
+- **Pip packages**: `pip install -U litellm mcp pyyaml`
+- **Provider key(s)**: set one or more of `OPENAI_API_KEY`, `ANTHROPIC_API_KEY`, `GEMINI_API_KEY`/`GOOGLE_API_KEY`, `GROQ_API_KEY`
+- **Your MCP servers**: whatever you reference in `mcp_config.json` (Node for filesystem server, Docker for others, etc.)
 
-### Configure MCP servers
-Define MCP servers in `mcp_config.json`. By default, the script looks for this file next to `tinyclient.py` (override with `-c/--config`).
-```1:25:mcp_config.json
+### Quick start
+```bash
+# 1) Install deps
+pip install -U litellm mcp pyyaml
+
+# 2) Put a config next to tinyclient.py
+echo {"mcpServers":{}} > mcp_config.json  # fill this in; see below
+
+# 3) Set an API key (example: Groq)
+export GROQ_API_KEY=sk-...
+
+# 4) Run
+python tinyclient.py
+```
+
+Windows (PowerShell) quick start:
+```powershell
+pip install -U litellm mcp pyyaml
+Set-Content -Path mcp_config.json -Value '{"mcpServers":{}}'
+$env:GROQ_API_KEY = 'sk-...'
+python .\tinyclient.py
+```
+
+### MCP servers (mcp_config.json)
+Place a `mcp_config.json` next to `tinyclient.py` (or pass `--config`). Example with filesystem and sqlite:
+```json
 {
-    "mcpServers": {
-        "filesystem": {
-            "command": "npx",
-            "args": [
-              "-y",
-              "@modelcontextprotocol/server-filesystem",
-              "C:\\workspace\\environment\\Assistant"
-            ]
-        },
-        "sqlite": {
-            "command": "docker",
-            "args": [
-                "run",
-                "--rm",
-                "-i",
-                "-v",
-                "./data:/mcp",
-                "mcp/sqlite",
-                "--db-path",
-                "/mcp/test.db"
-            ]
-        }  
-    } 
+  "mcpServers": {
+    "filesystem": {
+      "command": "npx",
+      "args": ["-y", "@modelcontextprotocol/server-filesystem", "."]
+    },
+    "sqlite": {
+      "command": "docker",
+      "args": [
+        "run", "--rm", "-i",
+        "-v", "./data:/mcp",
+        "mcp/sqlite",
+        "--db-path", "/mcp/test.db"
+      ]
+    }
+  }
 }
 ```
 Notes:
-- **filesystem**: requires Node.js/npm. `npx @modelcontextprotocol/server-filesystem <root>` exposes a directory.
-- **sqlite**: requires Docker. On Windows, bind mounts may work better with absolute paths (e.g., `${pwd}/data:/mcp`).
-- Tool names are **namespaced** by server (e.g., `filesystem_list`), and deduplicated if needed.
+- **filesystem** needs Node.js; `npx @modelcontextprotocol/server-filesystem <root>` exposes a directory.
+- **sqlite** needs Docker; on Windows prefer absolute host paths for `-v`.
+- Tool names are namespaced by server (e.g., `filesystem_list`) and deduped if needed.
 
-### Usage
-Run the CLI:
-```powershell
-# Default: looks for mcp_config.json next to the script
-$env:OPENAI_API_KEY = "sk-..."
+### App config (tinyclient_config.yaml)
+Optional file next to `tinyclient.py` for defaults/aliases and runtime settings. CLI flags override YAML.
+```yaml
+system_prompt: |
+  You are a helpful assistant.
+
+model_aliases:
+  # Aliases you can pass via --model
+  "4o-mini": "gpt-4o-mini"
+  "sonnet": "claude-3-7-sonnet-20250219"
+  "pro": "gemini/gemini-2.5-pro"
+  "llamaL": "groq/llama-3.3-70b-versatile"
+
+# Runtime settings (all optional)
+log_level: INFO          # or DEBUG, WARNING, ERROR
+log_json: false          # emit structured logs to stderr
+max_tokens: 4096         # safely capped depending on provider
+max_tool_hops: 25
+tool_result_max_chars: 8000
+tool_timeout_seconds: 45
+max_parallel_tools: 4    # 0=serial, N>0 bounded
+tool_preview_lines: 0    # print first N lines of each tool result
+```
+Precedence for the system prompt: `--system-prompt` > `--system-prompt-file` > `tinyclient_config.yaml` > legacy `prompt.txt` (if present) > built-in default.
+Other settings precedence: CLI flag > `tinyclient_config.yaml` > built-in default.
+
+### Run it
+```bash
+# default: reads ./mcp_config.json
 python tinyclient.py
 
-# Or pass a custom file via -c/--config
-python tinyclient.py -c path\\to\\mcp_config.json
-```
-During a session:
-- Type your message and press Enter
-- `/new`: reset conversation
-- `/history`: print current conversation buffer
-- `/clean`: gracefully stop servers and delete the `data` directory (with the sqlite DB)
-- `quit` or `exit`: leave the program
+# choose provider defaults quickly
+python tinyclient.py -o   # OpenAI
+python tinyclient.py -a   # Anthropic
+python tinyclient.py -g   # Gemini
+python tinyclient.py -q   # Groq
 
-The CLI prints:
-- `→ Tool: <name> {args}` before execution
-- `← Result:` with the tool's normalized output (truncated to a safe length)
+# override model explicitly (alias or full name)
+python tinyclient.py --model 4o-mini
+```
+
+REPL commands:
+- `/new`: reset conversation
+- `/history`: dump current messages
+- `/tools`: list servers → tools
+- `/model`: list model aliases from YAML; `/model <alias|full-name>` switches model without adding a message
+- `/reload`: restart servers and re-list tools
+- `/clean`: shutdown; may remove `./data` (helpful for Docker volume examples)
+- `quit`/`exit`: leave
 
 ### CLI flags
-All defaults can be overridden at runtime via flags:
-
-```powershell
-python tinyclient.py \
-  --model gemini-2.5-pro \
-  --max-tokens 1500 \
-  --max-tool-hops 10 \
-  --tool-timeout-seconds 30 \
-  --tool-result-max-chars 8000 \
-  --system-prompt "You are helpful." \
-  --system-prompt-file C:\\path\\to\\prompt.txt \
-  --no-prompt-txt \
-  --log-level INFO
-```
-Provider shortcuts (default provider is Google/Gemini):
-
-```powershell
-# Gemini (default if none specified)
-python tinyclient.py -g
-
-# OpenAI
-python tinyclient.py -o
-
-# Anthropic
-python tinyclient.py -a
-
-# Groq
-python tinyclient.py -q
-
-# You can still override with an explicit --model at any time
-python tinyclient.py -o --model gpt-4.1-mini
+```text
+--config PATH                Path to mcp_config.json
+--model NAME                 Model name or alias (e.g., sonnet, gpt-4o-mini)
+-o | -a | -g | -q            Provider shortcuts (OpenAI | Anthropic | Gemini | Groq)
+--max-tokens N               Max tokens per response (safely capped for some providers)
+--max-tool-hops N            Max tool-use hops per user turn
+--max-parallel-tools N       0 = serial, N > 0 = bounded concurrency (default 4)
+--tool-preview-lines N       Print first N lines of each tool result (0 = off)
+--tool-result-max-chars N    Truncate tool results to this many chars (default 8000)
+--tool-timeout-seconds SEC   Per tool-call timeout (default 30)
+--system-prompt TEXT         Inline system prompt
+--system-prompt-file PATH    Load system prompt from file
+--log-level LEVEL            DEBUG | INFO | WARNING | ERROR
+--log-json                   Emit structured JSON logs to stderr
 ```
 
+### What you’ll see
+- Streaming assistant tokens on stdout.
+- Tool calls logged as they happen: `→ [n] server_tool {args}`.
+- Summaries when tools resolve: `← [n] server_tool: ok (1.23s) [42 lines]`.
+- Tool results are fed back to the model (truncated to `--tool-result-max-chars`).
 
-Notes:
-- Flags are optional; unspecified ones use compiled defaults.
-- `--no-prompt-txt` disables auto-loading `prompt.txt` next to the script.
+### Provider/auth notes
+- The client infers provider from the model name and requires relevant env vars:
+  - OpenAI → `OPENAI_API_KEY`
+  - Anthropic → `ANTHROPIC_API_KEY`
+  - Gemini → `GEMINI_API_KEY` or `GOOGLE_API_KEY`
+  - Groq → `GROQ_API_KEY`
+- Gemini ADC gotcha: if you hit Google ADC errors you’re on a Vertex path. Prefer AI Studio with `gemini/<model>` and `GEMINI_API_KEY`, or explicitly use Vertex via provider-prefixed models.
 
-### System prompt
-- You can provide a system prompt inline with `--system-prompt` or via `--system-prompt-file`.
-- If no flag is provided and a `prompt.txt` file exists next to `tinyclient.py`, it will be used automatically.
-- If none of the above are provided, a compiled-in default will be used.
-
-Precedence (highest to lowest): `--system-prompt` > `--system-prompt-file` > `prompt.txt` (same folder) > default.
-
-### How it works (high-level)
-- `MCPToolRouter` loads servers, aggregates tool schemas into OpenAI-style `tools=[{type:"function", function:{name, description, parameters}}]`.
-- `LLMOrchestrator` streams messages via LiteLLM, detects `tool_calls`, executes them via the router, and appends `role:"tool"` messages with `tool_call_id` until completion or hop limit.
-- Stdout shows streaming text and tool activity for transparency.
-
-### Provider quickstart
-
-- OpenAI
-  - Set `OPENAI_API_KEY`
-  - Example models: `gpt-4o-mini`, `gpt-4o`, `o3-mini`
-  - Default here: `gpt-4o-mini`
-
-- Anthropic
-  - Set `ANTHROPIC_API_KEY`
-  - Example models: `claude-3-5-sonnet-20241022`, `claude-3-5-haiku-latest`
-  - Default here: `claude-3-5-sonnet-20241022`
-
-- Gemini (Google)
-  - Set `GOOGLE_API_KEY` (or `GEMINI_API_KEY`)
-  - Example models: `gemini-1.5-pro`, `gemini-1.5-flash`
-  - Default here: `gemini-1.5-pro`
-
-The script will emit a warning if it detects a provider by model name and the likely env var isn’t set.
+### Implementation details
+- MCP servers are spawned via stdio. Tool input schemas must be JSON Schema objects.
+- Tools are converted to OpenAI-style function tools and namespaced `<server>_<tool>`.
+- Multi-hop tool use with retry/backoff on LLM calls; bounded tool concurrency (`--max-parallel-tools`).
+- Safe token caps per provider to avoid over-asking.
 
 ### Troubleshooting
-- "Config file not found": ensure `mcp_config.json` exists or pass `-c <path>`.
-- "Requested command ... not found on PATH": install the tool and ensure PATH contains it (e.g., Node for `npx`, Docker for `docker`).
-- Tool timeouts: increase `TOOL_TIMEOUT_SEC` or check server responsiveness.
-- No tools loaded: confirm your servers actually expose tools and initialize without errors.
-- Auth: set the appropriate provider key(s), e.g., `OPENAI_API_KEY`, and verify network egress.
-- Windows + Docker volumes: prefer absolute host paths for `-v`.
-
-Gemini ADC error:
-- If you see a `DefaultCredentialsError` referencing Google ADC, you're hitting the Vertex AI flow. This client defaults Gemini models to the AI Studio provider (`gemini/<model>`) when a `GEMINI_API_KEY`/`GOOGLE_API_KEY` is present. If you want Vertex, set `GOOGLE_APPLICATION_CREDENTIALS` and `VERTEXAI_PROJECT` (and optionally region) or pass a provider-prefixed model like `vertex_ai/gemini-2.5-pro`. If you want AI Studio, ensure your model is unprefixed and `GEMINI_API_KEY` is set; the code will map it to `gemini/<model>` for you.
+- Config missing: create or pass `--config`.
+- Command not found: ensure `command` in `mcp_config.json` exists on PATH.
+- No tools loaded: your server may have started without tools or failed to init.
+- Timeouts: raise `--tool-timeout-seconds` or inspect server logs.
+- Windows + Docker: use absolute host paths for `-v` mounts.
 
 ### License
-Not specified. Add a license if you plan to distribute.
-
+Unlicensed. Add your own license file if you plan to distribute.
 
