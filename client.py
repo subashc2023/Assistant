@@ -18,7 +18,6 @@ import pathlib
 import argparse
 import time
 import re
-import textwrap
 from typing import Any, Dict, List, Optional, Tuple
 from dataclasses import dataclass
 from contextlib import AsyncExitStack
@@ -709,16 +708,7 @@ class LLMOrchestrator:
         header_shown = False
         label = self.theme.label("[Assistant]", "cyan") + " "
         
-        # Use textwrap for proper line wrapping
-        wrapper = textwrap.TextWrapper(
-            width=get_terminal_width() - len(re.sub(r'\x1b\[[0-9;]*[A-Za-z]', '', label)),
-            subsequent_indent=' ' * len(re.sub(r'\x1b\[[0-9;]*[A-Za-z]', '', label)),
-            break_long_words=False,
-            replace_whitespace=False
-        )
-
         try:
-            content_lines = []
             async for chunk in stream:
                 content = parser.process_chunk(chunk)
                 
@@ -726,13 +716,10 @@ class LLMOrchestrator:
                     if show_header and not header_shown:
                         print("\n" + label, end="", flush=True)
                         header_shown = True
-                    content_lines.append(content)
-                    
-                    # Print wrapped content
-                    full_content = ''.join(content_lines)
-                    wrapped = wrapper.fill(full_content)
-                    print('\r' + label + wrapped, end="", flush=True)
+                    # Just print content directly as it streams
+                    print(content, end="", flush=True)
 
+            # Final newline if content was shown
             if header_shown or (show_header and parser.content_buffer):
                 print(flush=True)
                 
