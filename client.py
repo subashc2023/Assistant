@@ -29,13 +29,19 @@ from mcp.client.stdio import stdio_client
 
 from config import AppConfig, Metrics, check_provider_auth
 
+# Constants
+DEFAULT_TERMINAL_WIDTH = 80
+MAX_EXCEPTION_LENGTH = 160
+PREVIEW_LENGTH = 120
+DEFAULT_TIMEOUT = 30.0
+RETRY_DELAYS = [1.0, 3.0, 5.0]
+
 SCRIPT_DIR = pathlib.Path(__file__).parent.resolve()
 MCP_CONFIG_FILE = SCRIPT_DIR / "mcp_config.json"
 
 logger = logging.getLogger(__name__)
 
 class AnsiTheme:
-
     def __init__(self, enabled: bool = True):
         self.enabled = enabled
         self.RESET = "\x1b[0m" if enabled else ""
@@ -86,11 +92,7 @@ class AnsiTheme:
         return colorer(self.bold(text))
 
     def sep(self, title: Optional[str] = None, char: str = "─") -> str:
-        try:
-            width = shutil.get_terminal_size(fallback=(80, 20)).columns
-        except Exception:
-            width = 80
-        width = max(20, min(width, 120))
+        width = get_terminal_width()
         if title:
             title_text = f" {title} "
             side = (width - len(title_text)) // 2
@@ -98,25 +100,19 @@ class AnsiTheme:
             return self.gray(line)
         return self.gray(char * width)
 
-THEME = AnsiTheme(enabled=True)
-
-def _strip_ansi(text: str) -> str:
+def get_terminal_width() -> int:
+    """Get terminal width with consistent fallback."""
     try:
-        return re.sub(r"\x1b\[[0-9;]*[A-Za-z]", "", text)
+        width = shutil.get_terminal_size(fallback=(DEFAULT_TERMINAL_WIDTH, 20)).columns
+        return max(20, min(width, 120))
     except Exception:
-        return text
+        return DEFAULT_TERMINAL_WIDTH
 
-def _short_exception(exc: BaseException, limit: int = 160) -> str:
-    try:
-        name = type(exc).__name__
-        text = str(exc)
-        if text and len(text) > limit:
-            text = text[:limit] + '…'
-        if not text:
-            return name
-        return f"{name}: {text}"
-    except Exception:
-        return repr(exc)
+def format_exception(exc: BaseException, limit: int = MAX_EXCEPTION_LENGTH) -> str:
+    """Format exception with length limit."""
+    name = type(exc).__name__
+    text = str(exc)[:limit]
+    return f"{name}: {text}" if text else name
 
 def configure_logging(config: AppConfig) -> None:
     level = getattr(logging, config.log_level, logging.INFO)
@@ -129,80 +125,14 @@ def configure_logging(config: AppConfig) -> None:
     for lib in ['httpx', 'anyio', 'mcp', 'urllib3', 'openai', 'LiteLLM', 'litellm']:
         logging.getLogger(lib).setLevel(logging.WARNING)
     
-    try:
-        litellm.set_verbose = False
-    except Exception:
-        pass
+    litellm.set_verbose = False
 
-class HangingIndentWriter:
-
-    def __init__(self, indent: str, width: int):
-        self.indent = indent
-        self.width = max(1, width)
-        self.col = 0  # current column count on this visual line (after indent)
-        self.buf: List[str] = []  # accumulation buffer per external flush
-        self.at_line_start = True
-
-    def _emit(self, s: str) -> None:
-        if s:
-            self.buf.append(s)
-
-    def _wrap_line(self) -> None:
-        self._emit("\n")
-        self._emit(self.indent)
-        self.col = 0
-        self.at_line_start = True
-
-    def feed(self, text: str) -> None:
-        # Handle CRLF by ignoring CR
-        text = text.replace("\r", "")
-        pos = 0
-        while True:
-            nl = text.find("\n", pos)
-            segment = text[pos:] if nl == -1 else text[pos:nl]
-            self._process_segment(segment)
-            if nl == -1:
-                break
-            # explicit newline
-            self._wrap_line()
-            pos = nl + 1
-
-    def _process_segment(self, segment: str) -> None:
-        if not segment:
-            return
-        # Split into whitespace and non-whitespace tokens (excluding newlines)
-        for tok in re.findall(r"(\s+|\S+)", segment):
-            if tok.isspace():
-                # Collapse any leading spaces at start of a visual line
-                if self.at_line_start or self.col == 0:
-                    continue
-                # Render a single space as separator
-                if self.col + 1 > self.width:
-                    self._wrap_line()
-                self._emit(" ")
-                self.col += 1
-                self.at_line_start = False
-            else:
-                word = tok
-                # If the word won't fit on this line, move it entirely to the next line
-                if self.col > 0 and (self.col + len(word) > self.width):
-                    self._wrap_line()
-                # Emit the whole word without hyphenation/breaking
-                self._emit(word)
-                self.col += len(word)
-                self.at_line_start = False
-                # If it overflows terminal width, keep logical col but do not force breaks;
-                # rare super-long tokens will visually wrap by the terminal.
-
-    def flush_buf(self) -> str:
-        if not self.buf:
-            return ""
-        out = ''.join(self.buf)
-        self.buf.clear()
-        return out
+def create_theme(config: AppConfig) -> AnsiTheme:
+    """Create theme based on config and terminal capabilities."""
+    enabled = bool(getattr(config, 'use_color', True) and sys.stdout.isatty())
+    return AnsiTheme(enabled=enabled)
 
 class MCPServer:
-
     def __init__(self, name: str, config: Dict[str, Any]):
         self.name = name
         self.config = config
@@ -278,9 +208,7 @@ class MCPServer:
         finally:
             self.session = None
 
-
 class MCPRouter:
-    
     def __init__(self):
         self.servers: List[MCPServer] = []
         self.tool_specs: List[Dict[str, Any]] = []
@@ -294,7 +222,6 @@ class MCPRouter:
         raw_servers = config.get("mcpServers", {})
         if not isinstance(raw_servers, dict):
             raise ValueError("mcp_config.json must contain 'mcpServers' object (dict) if present")
-
 
         discovered = self._discover_local_servers(config_path)
 
@@ -399,50 +326,27 @@ class MCPRouter:
 
     def _discover_local_servers(self, config_path: pathlib.Path) -> Dict[str, Dict[str, Any]]:
         servers: Dict[str, Dict[str, Any]] = {}
-
-        candidates: List[pathlib.Path] = []
-        try:
-            cfg_dir = config_path.parent
-            candidates.append(cfg_dir / "servers")
-        except Exception:
-            pass
-        try:
-            candidates.append(SCRIPT_DIR / "servers")
-        except Exception:
-            pass
-
-
-        seen: set = set()
-        unique_dirs: List[pathlib.Path] = []
+        candidates = [config_path.parent / "servers", SCRIPT_DIR / "servers"]
+        
+        seen = set()
         for d in candidates:
             try:
                 rp = d.resolve()
-            except Exception:
-                rp = d
-            if rp in seen:
-                continue
-            seen.add(rp)
-            unique_dirs.append(d)
-
-        for root in unique_dirs:
-            try:
-                if not root.exists() or not root.is_dir():
+                if rp in seen or not rp.exists() or not rp.is_dir():
                     continue
-                for py in root.glob("*.py"):
-                    if py.name == "__init__.py" or py.name.startswith("._") or py.name.startswith("~"):
+                seen.add(rp)
+                
+                for py in d.glob("*.py"):
+                    if py.name in ("__init__.py", ) or py.name.startswith(("._", "~")):
                         continue
                     name = py.stem
-                    try:
-                        cmd = sys.executable or "python"
-                    except Exception:
-                        cmd = "python"
+                    cmd = sys.executable or "python"
                     servers.setdefault(name, {
                         "command": cmd,
                         "args": [str(py.resolve())],
-                        # inherit environment
                     })
             except Exception as e:
-                logger.debug("Local server discovery error in %s: %r", str(root), e)
+                logger.debug("Local server discovery error in %s: %r", str(d), e)
 
         if servers:
             logger.info("Discovered %d local MCP servers in ./servers", len(servers))
@@ -471,21 +375,16 @@ class ToolResult:
         }
 
 class ToolExecutor:
-
     def __init__(self, router: MCPRouter, config: AppConfig):
         self.router = router
         self.config = config
-
     
     async def execute_batch(self, tool_calls: List[Dict]) -> List[ToolResult]:
         results = []
-        tasks = []
-
-        limit = self.config.max_parallel_tools
-        if limit is None or limit <= 0:
-            limit = 1
+        limit = max(1, self.config.max_parallel_tools or 1)
         sem = asyncio.Semaphore(limit)
         
+        tasks = []
         for tc in tool_calls:
             name = tc.get("function", {}).get("name", "")
             args_str = tc.get("function", {}).get("arguments", "{}")
@@ -503,8 +402,9 @@ class ToolExecutor:
         return results
     
     async def _execute_single(self, name: str, args_str: Any,
-                             tool_call_id: str, sem: Optional[asyncio.Semaphore]) -> ToolResult:
-        try:# Some providers send already-serialized JSON strings; try parse; accept dict directly.
+                             tool_call_id: str, sem: asyncio.Semaphore) -> ToolResult:
+        # Parse arguments
+        try:
             if isinstance(args_str, str):
                 args = json.loads(args_str) if args_str.strip() else {}
             elif isinstance(args_str, dict):
@@ -520,7 +420,7 @@ class ToolExecutor:
                 duration=0.0
             )
         
-        async def _run():
+        async with sem:
             start = time.monotonic()
             try:
                 result = await asyncio.wait_for(
@@ -557,12 +457,6 @@ class ToolExecutor:
                     success=False,
                     duration=time.monotonic() - start
                 )
-
-        if sem:
-            async with sem:
-                return await _run()
-        else:
-            return await _run()
     
     def _format_result(self, result: Any) -> Tuple[str, bool, int]:
         try:
@@ -575,15 +469,13 @@ class ToolExecutor:
                         parts.append(json.dumps(item, indent=2, ensure_ascii=False))
                 text = '\n'.join(parts)
             else:
-                text, was_truncated = self._json_truncate(result, self.config.tool_result_max_chars)
-                lines = len(text.splitlines())
-                return text or "[empty response]", was_truncated, lines
+                text = json.dumps(result, indent=2, ensure_ascii=False)
             
             lines = len(text.splitlines())
-
+            
             if len(text) > self.config.tool_result_max_chars:
                 text = text[:self.config.tool_result_max_chars]
-                return text, True, lines
+                return text or "[empty response]", True, lines
             
             return text or "[empty response]", False, lines
             
@@ -595,27 +487,7 @@ class ToolExecutor:
                 return text, True, lines
             return text, False, lines
 
-    def _json_truncate(self, obj: Any, limit: int) -> Tuple[str, bool]:
-        try:
-            encoder = json.JSONEncoder(ensure_ascii=False, indent=2)
-            parts: List[str] = []
-            total = 0
-            for chunk in encoder.iterencode(obj):
-                parts.append(chunk)
-                total += len(chunk)
-                if total >= limit:
-                    s = ''.join(parts)
-                    return s[:limit], True
-            s = ''.join(parts)
-            return s, False
-        except Exception:
-            s = str(obj)
-            if len(s) > limit:
-                return s[:limit], True
-            return s, False
-
 class StreamParser:
-
     def __init__(self):
         self.content_buffer: List[str] = []
         self.tool_calls: Dict[int, Dict] = {}
@@ -625,16 +497,16 @@ class StreamParser:
         try:
             delta = chunk.choices[0].delta
 
-            # Handle content - always show it to the user
+            # Handle content
             content = self._get_attr(delta, 'content')
             if content:
                 self.content_buffer.append(content)
                 return content
 
-            # Handle structured tool calls only
+            # Handle tool calls
             tool_calls = self._get_attr(delta, 'tool_calls')
             if tool_calls:
-                self._process_structured_tool_calls(tool_calls)
+                self._process_tool_calls(tool_calls)
             
             return None
                 
@@ -648,14 +520,12 @@ class StreamParser:
             return obj.get(attr)
         return None
     
-    def _process_structured_tool_calls(self, tool_calls: List) -> None:
+    def _process_tool_calls(self, tool_calls: List) -> None:
         for tc in tool_calls:
-            # Use the index provided by the LLM, or assign sequentially
             idx = self._get_attr(tc, 'index')
             if idx is None:
                 idx = len(self.tool_calls)
             
-            # Initialize tool call if not exists
             if idx not in self.tool_calls:
                 self.tool_calls[idx] = {
                     'id': None,
@@ -664,31 +534,25 @@ class StreamParser:
                 }
                 self.tool_args_buffer[idx] = []
 
-            # Update tool call ID
             tc_id = self._get_attr(tc, 'id')
             if tc_id:
                 self.tool_calls[idx]['id'] = tc_id
 
-            # Update tool call type
             tc_type = self._get_attr(tc, 'type')
             if tc_type:
                 self.tool_calls[idx]['type'] = tc_type
 
-            # Update function details
             func = self._get_attr(tc, 'function')
             if func:
-                # Update function name
                 name = self._get_attr(func, 'name')
                 if name:
                     self.tool_calls[idx]['function']['name'] = name
                 
-                # Update function arguments (accumulate streaming chunks)
                 args = self._get_attr(func, 'arguments')
                 if args is not None:
                     if isinstance(args, str):
                         self.tool_args_buffer[idx].append(args)
                     else:
-                        # Handle non-string arguments by JSON serializing
                         try:
                             self.tool_args_buffer[idx].append(json.dumps(args, ensure_ascii=False))
                         except Exception:
@@ -700,114 +564,33 @@ class StreamParser:
             'content': ''.join(self.content_buffer).strip() or None
         }
 
-
         if self.tool_calls:
             tool_calls = []
-            next_id_suffix = 0
             for idx in sorted(self.tool_calls.keys()):
-                base_tc = self.tool_calls[idx].copy()
-                # Ensure function object exists
-                if 'function' not in base_tc or base_tc['function'] is None:
-                    base_tc['function'] = {'name': None, 'arguments': ''}
-
-                # Concatenate all argument chunks
+                tc = self.tool_calls[idx].copy()
+                if 'function' not in tc:
+                    tc['function'] = {'name': None, 'arguments': ''}
+                
+                # Join argument chunks
                 args_parts = self.tool_args_buffer.get(idx, [])
-                concatenated = ''.join(args_parts)
-
-                # If provider streamed multiple JSON objects back-to-back (e.g., Gemini),
-                # split them into separate tool calls so each has valid JSON arguments.
-                split_args_list = self._split_concatenated_json_objects(concatenated)
-
-                for part_i, args_str in enumerate(split_args_list):
-                    tc = {
-                        'id': base_tc.get('id'),
-                        'type': base_tc.get('type', 'function'),
-                        'function': {
-                            'name': base_tc.get('function', {}).get('name'),
-                            'arguments': args_str
-                        }
-                    }
-
-                    # Ensure unique, stable id per materialized call
-                    if not tc.get('id'):
-                        tc['id'] = f'call_{idx}_{part_i}' if len(split_args_list) > 1 else f'call_{idx}'
-                    else:
-                        # If upstream reused the same id across multiple parts, suffix it
-                        if len(split_args_list) > 1:
-                            tc['id'] = f"{tc['id']}_{part_i}"
-
-                    tool_calls.append(tc)
-
+                tc['function']['arguments'] = ''.join(args_parts)
+                
+                # Ensure ID exists
+                if not tc.get('id'):
+                    tc['id'] = f'call_{idx}'
+                
+                tool_calls.append(tc)
+            
             message['tool_calls'] = tool_calls
         
         return message
 
-    def _split_concatenated_json_objects(self, text: str) -> List[str]:
-
-        s = (text or '').strip()
-        if not s:
-            return [text or '']
-
-
-        if s.startswith('{') and s.endswith('}'):
-            try:
-                json.loads(s)
-                return [s]
-            except Exception:
-                pass
-
-
-        parts: List[str] = []
-        depth = 0
-        start_idx = None
-        in_string = False
-        escape = False
-
-        for i, ch in enumerate(s):
-            if in_string:
-                if escape:
-                    escape = False
-                elif ch == '\\':
-                    escape = True
-                elif ch == '"':
-                    in_string = False
-                continue
-
-            if ch == '"':
-                in_string = True
-                continue
-
-            if ch == '{':
-                if depth == 0:
-                    start_idx = i
-                depth += 1
-            elif ch == '}':
-                depth -= 1
-                if depth == 0 and start_idx is not None:
-                    candidate = s[start_idx:i+1]
-                    # Only accept well-formed JSON objects
-                    try:
-                        json.loads(candidate)
-                        parts.append(candidate)
-                        start_idx = None
-                    except Exception:
-
-                        pass
-
-
-        if len(parts) > 1:
-            return parts
-
-
-        return [text]
-
-
 class LLMOrchestrator:
-
-    def __init__(self, config: AppConfig, router: MCPRouter, metrics: Metrics):
+    def __init__(self, config: AppConfig, router: MCPRouter, metrics: Metrics, theme: AnsiTheme):
         self.config = config
         self.router = router
         self.metrics = metrics
+        self.theme = theme
         self.executor = ToolExecutor(router, config)
         self.conversation: List[Dict[str, Any]] = []
 
@@ -825,81 +608,65 @@ class LLMOrchestrator:
             except Exception:
                 pass
         
-        try:
-            callbacks = getattr(litellm, 'success_callback', [])
-            if not isinstance(callbacks, list):
-                callbacks = [callbacks]
-            callbacks.append(callback)
-            litellm.success_callback = callbacks
-        except Exception:
-            pass
+        callbacks = getattr(litellm, 'success_callback', [])
+        if not isinstance(callbacks, list):
+            callbacks = [callbacks] if callbacks else []
+        callbacks.append(callback)
+        litellm.success_callback = callbacks
 
-
-        try:
-            if hasattr(self.config, 'model_aliases') and self.config.model_aliases:
-                setattr(litellm, 'model_alias_map', dict(self.config.model_aliases))
-        except Exception:
-            pass
+        if hasattr(self.config, 'model_aliases') and self.config.model_aliases:
+            litellm.model_alias_map = dict(self.config.model_aliases)
     
     async def run_turn(self, user_input: str) -> str:
         self.conversation.append({"role": "user", "content": user_input})
 
         final_response = []
         tool_cycles = 0
-        tool_calls: Optional[List[Dict[str, Any]]] = None
 
         while tool_cycles < self.config.max_tool_hops:
             show_header = True
             assistant_msg = await self._call_llm_streaming(show_header)
 
-            # Always collect the assistant's content
             if assistant_msg.get("content"):
                 final_response.append(assistant_msg["content"])
 
             self.conversation.append(assistant_msg)
 
-            # Check for tool calls
             tool_calls = assistant_msg.get("tool_calls", [])
             if not tool_calls:
                 break
 
             # Display tool requests
-            print("\n" + THEME.sep("Tools request"))
+            print("\n" + self.theme.sep("Tools request"))
             for i, tc in enumerate(tool_calls, 1):
                 name = tc.get("function", {}).get("name", "")
                 args = tc.get("function", {}).get("arguments", "{}")
-                print(f"  [{i:02d}] {THEME.bold(THEME.blue(name))} {THEME.gray(args)}", flush=True)
+                print(f"  [{i:02d}] {self.theme.bold(self.theme.blue(name))} {self.theme.gray(args)}", flush=True)
             
             # Execute tools
             results = await self.executor.execute_batch(tool_calls)
 
-            # Sort results to match original tool call order
-            id_order: Dict[str, int] = {}
-            for idx, tc in enumerate(tool_calls):
-                tc_id = tc.get("id") or f"call_{idx}"
-                id_order[tc_id] = idx
+            # Sort results
+            id_order = {tc.get("id", f"call_{i}"): i for i, tc in enumerate(tool_calls)}
             results_sorted = sorted(results, key=lambda r: id_order.get(r.tool_call_id, 10**9))
 
-            # Display tool results
-            print(THEME.sep("Tools results"))
+            # Display results
+            print(self.theme.sep("Tools results"))
             for i, r in enumerate(results_sorted, 1):
                 status = "ok" if r.success else "error"
-                status_colored = THEME.green(status) if r.success else THEME.red(status)
-                idx_label = THEME.bold(f"[{i:02d}]")
-                print(f"← {idx_label} {THEME.bold(THEME.blue(r.name))}: {status_colored} ({r.duration:.2f}s) [{r.lines} lines]", flush=True)
+                status_colored = self.theme.green(status) if r.success else self.theme.red(status)
+                idx_label = self.theme.bold(f"[{i:02d}]")
+                print(f"← {idx_label} {self.theme.bold(self.theme.blue(r.name))}: {status_colored} ({r.duration:.2f}s) [{r.lines} lines]", flush=True)
 
-                # Show preview if configured
                 if self.config.tool_preview_lines > 0 and r.success:
                     preview = '\n'.join(r.content.splitlines()[:self.config.tool_preview_lines])
                     if preview:
-                        print(THEME.gray(preview), flush=True)
+                        print(self.theme.gray(preview), flush=True)
 
-            # Add tool results to conversation
             for result in results_sorted:
                 self.conversation.append(result.to_message())
 
             tool_cycles += 1
-
 
         if tool_cycles >= self.config.max_tool_hops and tool_calls:
             final_msg = await self._call_llm_streaming(True, allow_tools=False)
@@ -926,67 +693,68 @@ class LLMOrchestrator:
             kwargs["tools"] = self.router.tool_specs
             kwargs["tool_choice"] = "auto"
 
-        retry_delays = [1.0, 3.0, 5.0]
-        for attempt, delay in enumerate(retry_delays + [None]):
+        for attempt, delay in enumerate(RETRY_DELAYS + [None]):
             try:
                 return await self._stream_response(kwargs, show_header)
             except Exception as e:
-                if delay is None:  # Last attempt
+                if delay is None:
                     raise
-                short = _short_exception(e)
-                print(THEME.yellow(f"[Retry {attempt+1}] {short} – retrying in {delay:.1f}s"))
+                short = format_exception(e)
+                print(self.theme.yellow(f"[Retry {attempt+1}] {short} – retrying in {delay:.1f}s"))
                 await asyncio.sleep(delay)
     
     async def _stream_response(self, kwargs: Dict, show_header: bool) -> Dict[str, Any]:
         parser = StreamParser()
         stream = await litellm.acompletion(**kwargs)
         header_shown = False
-        label = THEME.label("[Assistant]", "cyan") + " "
-        plain_label = _strip_ansi(label)
-        indent = " " * len(plain_label)
+        label = self.theme.label("[Assistant]", "cyan") + " "
+        
+        # Use textwrap for proper line wrapping
+        wrapper = textwrap.TextWrapper(
+            width=get_terminal_width() - len(re.sub(r'\x1b\[[0-9;]*[A-Za-z]', '', label)),
+            subsequent_indent=' ' * len(re.sub(r'\x1b\[[0-9;]*[A-Za-z]', '', label)),
+            break_long_words=False,
+            replace_whitespace=False
+        )
 
         try:
-            # Cache terminal width and use a deterministic hanging-indent writer
-            try:
-                term_width = shutil.get_terminal_size(fallback=(80, 20)).columns
-            except Exception:
-                term_width = 80
-            avail = max(10, term_width - len(plain_label))
-            writer = HangingIndentWriter(indent=indent, width=avail)
-
+            content_lines = []
             async for chunk in stream:
                 content = parser.process_chunk(chunk)
-
-                # Always show content to user as it streams
+                
                 if content:
                     if show_header and not header_shown:
                         print("\n" + label, end="", flush=True)
                         header_shown = True
-                    writer.feed(content)
-                    chunk_out = writer.flush_buf()
-                    if chunk_out:
-                        print(chunk_out, end="", flush=True)
+                    content_lines.append(content)
+                    
+                    # Print wrapped content
+                    full_content = ''.join(content_lines)
+                    wrapped = wrapper.fill(full_content)
+                    print('\r' + label + wrapped, end="", flush=True)
 
-            # Add a newline after streaming content (if any content was shown)
             if header_shown or (show_header and parser.content_buffer):
-                if not header_shown and show_header:
-                    print("\n" + label, end="", flush=True)
                 print(flush=True)
                 
         finally:
             try:
                 await stream.aclose()
-            except Exception as e:
+            except Exception:
                 logger.debug("Stream close error", exc_info=True)
         
         return parser.get_message()
 
 class CommandHandler:
-    
-    def __init__(self, orchestrator: LLMOrchestrator, router: MCPRouter, config: AppConfig):
+    def __init__(self, orchestrator: LLMOrchestrator, router: MCPRouter, config: AppConfig, theme: AnsiTheme):
         self.orchestrator = orchestrator
         self.router = router
         self.config = config
+        self.theme = theme
+        
+        # Valid commands for input validation
+        self.valid_commands = {
+            '/quit', '/exit', '/new', '/tools', '/model', '/reload', '/clean'
+        }
     
     async def handle(self, user_input: str) -> bool:
         if not user_input.strip():
@@ -998,10 +766,10 @@ class CommandHandler:
         try:
             await self.orchestrator.run_turn(user_input)
         except KeyboardInterrupt:
-            print("\n" + THEME.label("[Info]", "blue") + " Response interrupted")
+            print("\n" + self.theme.label("[Info]", "blue") + " Response interrupted")
         except Exception as e:
             logger.debug("Chat error", exc_info=True)
-            print(THEME.red(f"[Error] {_short_exception(e)}"))
+            print(self.theme.red(f"[Error] {format_exception(e)}"))
         
         return True
     
@@ -1009,6 +777,12 @@ class CommandHandler:
         parts = cmd.split(maxsplit=1)
         command = parts[0].lower()
         args = parts[1] if len(parts) > 1 else ""
+        
+        # Validate command
+        if command not in self.valid_commands:
+            print(f"Unknown command: {command}")
+            print("Commands: /new, /tools, /model, /reload, /quit")
+            return True
 
         if command in ['/quit', '/exit']:
             print("👋 Bye.")
@@ -1025,18 +799,13 @@ class CommandHandler:
         elif command == '/model':
             if not args:
                 print(f"Current model: {self.config.model}")
-                try:
-                    alias_map = getattr(litellm, 'model_alias_map', {}) or {}
-                    if alias_map:
-                        print("Available aliases:")
-                        for alias, full in sorted(alias_map.items()):
-                            print(f"  {alias} -> {full}")
-                except Exception:
-                    pass
+                alias_map = getattr(litellm, 'model_alias_map', {}) or {}
+                if alias_map:
+                    print("Available aliases:")
+                    for alias, full in sorted(alias_map.items()):
+                        print(f"  {alias} -> {full}")
             else:
-                # Let LiteLLM resolve aliases via litellm.model_alias_map; store as given
                 model = args
-                # For auth + caps, check using the resolved target if alias exists
                 alias_map = getattr(litellm, 'model_alias_map', {}) or {}
                 effective_model = alias_map.get(model, model)
                 ok, missing = check_provider_auth(effective_model)
@@ -1048,22 +817,18 @@ class CommandHandler:
                     print(f"[Info] Switched to {model}")
         
         elif command == '/reload':
-            print(THEME.label("[Info]", "blue") + " Reloading MCP servers...")
+            print(self.theme.label("[Info]", "blue") + " Reloading MCP servers...")
             try:
                 await self.router.cleanup()
                 await self.router.load_and_start(MCP_CONFIG_FILE)
-                print(f"{THEME.green('✅ Reloaded')}: {len(self.router.servers)} servers, {len(self.router.tool_specs)} tools")
+                print(f"{self.theme.green('✅ Reloaded')}: {len(self.router.servers)} servers, {len(self.router.tool_specs)} tools")
             except Exception as e:
                 logger.debug("Reload failed", exc_info=True)
-                print(THEME.red(f"[Error] Reload failed: {_short_exception(e)}"))
+                print(self.theme.red(f"[Error] Reload failed: {format_exception(e)}"))
         
         elif command == '/clean':
             print("[Info] Cleanup requested")
             return False
-        
-        else:
-            print(f"Unknown command: {command}")
-            print("Commands: /new, /tools, /model, /reload, /quit")
         
         return True
 
@@ -1093,29 +858,21 @@ async def amain(args: argparse.Namespace) -> None:
     elif args.provider_groq:
         cli_args['provider'] = 'groq'
 
-    config = AppConfig.load(
-        cli_args=cli_args
-    )
-
+    config = AppConfig.load(cli_args=cli_args)
     configure_logging(config)
     
-    try:
-        global THEME
-        THEME.enabled = bool(getattr(config, 'use_color', True) and sys.stdout.isatty())
-    except Exception:
-        THEME.enabled = False
-
-
+    # Create theme based on config
+    theme = create_theme(config)
 
     ok, missing = check_provider_auth(config.model)
     if not ok:
         print(f"[Fatal] Missing API credentials: {', '.join(missing)}")
         sys.exit(1)
 
-    print(THEME.sep("LiteLLM MCP CLI Chat"))
-    print(f"{THEME.label('[Model]', 'magenta')} {config.model}")
-    print(f"{THEME.label('[Config]', 'magenta')} {args.config}")
-    print(THEME.gray("Type '/quit' or '/exit' to exit. Commands: /new, /history, /tools, /model, /reload, /quit"))
+    print(theme.sep("LiteLLM MCP CLI Chat"))
+    print(f"{theme.label('[Model]', 'magenta')} {config.model}")
+    print(f"{theme.label('[Config]', 'magenta')} {args.config}")
+    print(theme.gray("Type '/quit' or '/exit' to exit. Commands: /new, /history, /tools, /model, /reload, /quit"))
 
     config_path = pathlib.Path(args.config)
     if not config_path.exists():
@@ -1128,23 +885,23 @@ async def amain(args: argparse.Namespace) -> None:
     
     try:
         await router.load_and_start(config_path)
-        print(f"{THEME.green('✅ Connected')}: {len(router.servers)} servers, {len(router.tool_specs)} tools")
+        print(f"{theme.green('✅ Connected')}: {len(router.servers)} servers, {len(router.tool_specs)} tools")
 
         for server, tools in sorted(router.get_server_tools_map().items()):
-            print(f"  - {THEME.cyan(server)}: {sorted(tools)}")
+            print(f"  - {theme.cyan(server)}: {sorted(tools)}")
 
         if config.system_prompt:
-            preview = config.system_prompt[:120]
-            if len(config.system_prompt) > 120:
+            preview = config.system_prompt[:PREVIEW_LENGTH]
+            if len(config.system_prompt) > PREVIEW_LENGTH:
                 preview += "…"
-            print("\n" + THEME.label("[System]", "yellow") + f" {preview}")
+            print("\n" + theme.label("[System]", "yellow") + f" {preview}")
 
-        orchestrator = LLMOrchestrator(config, router, metrics)
-        handler = CommandHandler(orchestrator, router, config)
+        orchestrator = LLMOrchestrator(config, router, metrics, theme)
+        handler = CommandHandler(orchestrator, router, config, theme)
 
         while True:
             try:
-                user_input = input("\n" + THEME.label("[You]", "green") + " ").strip()
+                user_input = input("\n" + theme.label("[You]", "green") + " ").strip()
             except (EOFError, KeyboardInterrupt):
                 print("\n👋 Bye.")
                 break
@@ -1153,13 +910,13 @@ async def amain(args: argparse.Namespace) -> None:
                 break
 
     finally:
-        print("\n" + THEME.label("[Info]", "blue") + " Cleaning up MCP connections...")
+        print("\n" + theme.label("[Info]", "blue") + " Cleaning up MCP connections...")
         try:
             await router.cleanup()
         except Exception as e:
             logger.warning("Cleanup error: %r", e)
 
-        print(f"{THEME.label('[Metrics]', 'magenta')} {metrics.summary()}")
+        print(f"{theme.label('[Metrics]', 'magenta')} {metrics.summary()}")
 
 def main():
     parser = argparse.ArgumentParser(description="Minimal MCP client with LiteLLM integration")
@@ -1181,11 +938,11 @@ def main():
     parser.add_argument("--log-json", action="store_true", help="Output JSON logs to stderr")
     parser.add_argument("--no-color", action="store_true", help="Disable ANSI colors")
     args = parser.parse_args()
+    
     try:
         asyncio.run(amain(args))
     except (KeyboardInterrupt, asyncio.CancelledError):
         print("\n[Info] Terminated")
-
 
 if __name__ == "__main__":
     main()
