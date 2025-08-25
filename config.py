@@ -34,7 +34,7 @@ PROVIDERS = {
     'gemini': {
         'prefixes': ['gemini/', 'google/'],
         'keywords': ['gemini', 'google'],
-        'env_vars': ['GEMINI_API_KEY', 'GOOGLE_API_KEY'],
+        'env_vars': ['GEMINI_API_KEY'],
         'max_tokens_cap': 8192
     }
 }

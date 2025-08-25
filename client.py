@@ -18,6 +18,7 @@ import shutil
 import pathlib
 import argparse
 import time
+import re
 from typing import Any, Dict, List, Optional, Tuple
 from dataclasses import dataclass
 from contextlib import AsyncExitStack
@@ -458,21 +459,21 @@ class StreamParser:
         self.content_buffer: List[str] = []
         self.tool_calls: Dict[int, Dict] = {}
         self.tool_args_buffer: Dict[int, List[str]] = {}
-        self._id_to_index: Dict[str, int] = {}
-        self._next_index: int = 0
     
     def process_chunk(self, chunk: Any) -> Optional[str]:
         try:
             delta = chunk.choices[0].delta
 
+            # Handle content - always show it to the user
             content = self._get_attr(delta, 'content')
             if content:
                 self.content_buffer.append(content)
                 return content
 
+            # Handle structured tool calls only
             tool_calls = self._get_attr(delta, 'tool_calls')
             if tool_calls:
-                self._process_tool_calls(tool_calls)
+                self._process_structured_tool_calls(tool_calls)
             
             return None
                 
@@ -486,21 +487,14 @@ class StreamParser:
             return obj.get(attr)
         return None
     
-    def _process_tool_calls(self, tool_calls: List) -> None:
+    def _process_structured_tool_calls(self, tool_calls: List) -> None:
         for tc in tool_calls:
-            raw_index = self._get_attr(tc, 'index')
-            tc_id = self._get_attr(tc, 'id')
-
-            if raw_index is not None:
-                idx = int(raw_index)
-            elif tc_id and tc_id in self._id_to_index:
-                idx = self._id_to_index[tc_id]
-            else:
-                idx = self._next_index
-                self._next_index += 1
-                if tc_id:
-                    self._id_to_index[tc_id] = idx
-
+            # Use the index provided by the LLM, or assign sequentially
+            idx = self._get_attr(tc, 'index')
+            if idx is None:
+                idx = len(self.tool_calls)
+            
+            # Initialize tool call if not exists
             if idx not in self.tool_calls:
                 self.tool_calls[idx] = {
                     'id': None,
@@ -509,45 +503,149 @@ class StreamParser:
                 }
                 self.tool_args_buffer[idx] = []
 
+            # Update tool call ID
+            tc_id = self._get_attr(tc, 'id')
             if tc_id:
                 self.tool_calls[idx]['id'] = tc_id
 
-            if tc_type := self._get_attr(tc, 'type'):
+            # Update tool call type
+            tc_type = self._get_attr(tc, 'type')
+            if tc_type:
                 self.tool_calls[idx]['type'] = tc_type
 
-            if func := self._get_attr(tc, 'function'):
-                if name := self._get_attr(func, 'name'):
+            # Update function details
+            func = self._get_attr(tc, 'function')
+            if func:
+                # Update function name
+                name = self._get_attr(func, 'name')
+                if name:
                     self.tool_calls[idx]['function']['name'] = name
-                if 'arguments' in (func if isinstance(func, dict) else dir(func)):
-                    args = self._get_attr(func, 'arguments')
-                    if args is None:
-                        pass
-                    elif isinstance(args, (dict, list)):
+                
+                # Update function arguments (accumulate streaming chunks)
+                args = self._get_attr(func, 'arguments')
+                if args is not None:
+                    if isinstance(args, str):
+                        self.tool_args_buffer[idx].append(args)
+                    else:
+                        # Handle non-string arguments by JSON serializing
                         try:
                             self.tool_args_buffer[idx].append(json.dumps(args, ensure_ascii=False))
                         except Exception:
                             self.tool_args_buffer[idx].append(str(args))
-                    else:
-                        self.tool_args_buffer[idx].append(str(args))
     
     def get_message(self) -> Dict[str, Any]:
         message = {
             'role': 'assistant',
-            'content': ''.join(self.content_buffer)
+            'content': ''.join(self.content_buffer).strip() or None
         }
 
+        # Add tool calls if any were parsed
         if self.tool_calls:
             tool_calls = []
+            next_id_suffix = 0
             for idx in sorted(self.tool_calls.keys()):
-                tc = self.tool_calls[idx].copy()
-                tc['id'] = tc.get('id') or f'call_{idx}'
-                args_concat = ''.join(self.tool_args_buffer.get(idx, []))
-                tc['function']['arguments'] = args_concat
-                tool_calls.append(tc)
-            
+                base_tc = self.tool_calls[idx].copy()
+                # Ensure function object exists
+                if 'function' not in base_tc or base_tc['function'] is None:
+                    base_tc['function'] = {'name': None, 'arguments': ''}
+
+                # Concatenate all argument chunks
+                args_parts = self.tool_args_buffer.get(idx, [])
+                concatenated = ''.join(args_parts)
+
+                # If provider streamed multiple JSON objects back-to-back (e.g., Gemini),
+                # split them into separate tool calls so each has valid JSON arguments.
+                split_args_list = self._split_concatenated_json_objects(concatenated)
+
+                for part_i, args_str in enumerate(split_args_list):
+                    tc = {
+                        'id': base_tc.get('id'),
+                        'type': base_tc.get('type', 'function'),
+                        'function': {
+                            'name': base_tc.get('function', {}).get('name'),
+                            'arguments': args_str
+                        }
+                    }
+
+                    # Ensure unique, stable id per materialized call
+                    if not tc.get('id'):
+                        tc['id'] = f'call_{idx}_{part_i}' if len(split_args_list) > 1 else f'call_{idx}'
+                    else:
+                        # If upstream reused the same id across multiple parts, suffix it
+                        if len(split_args_list) > 1:
+                            tc['id'] = f"{tc['id']}_{part_i}"
+
+                    tool_calls.append(tc)
+
             message['tool_calls'] = tool_calls
         
         return message
+
+    def _split_concatenated_json_objects(self, text: str) -> List[str]:
+        """
+        Best-effort splitter for cases where multiple JSON objects are concatenated
+        without separators, e.g. "{...}{...}{...}". If the input parses as a single
+        JSON object or empty/invalid, fall back to returning the original string.
+
+        This is needed because some providers (notably Gemini via various SDK layers)
+        may stream tool-call argument objects as adjacent JSON without commas.
+        """
+        s = (text or '').strip()
+        if not s:
+            return [text or '']
+
+        # Fast path: if it looks like a single object and is valid JSON, return as-is
+        if s.startswith('{') and s.endswith('}'):
+            try:
+                json.loads(s)
+                return [s]
+            except Exception:
+                pass
+
+        # Scan and split on balanced top-level braces, respecting strings
+        parts: List[str] = []
+        depth = 0
+        start_idx = None
+        in_string = False
+        escape = False
+
+        for i, ch in enumerate(s):
+            if in_string:
+                if escape:
+                    escape = False
+                elif ch == '\\':
+                    escape = True
+                elif ch == '"':
+                    in_string = False
+                continue
+
+            if ch == '"':
+                in_string = True
+                continue
+
+            if ch == '{':
+                if depth == 0:
+                    start_idx = i
+                depth += 1
+            elif ch == '}':
+                depth -= 1
+                if depth == 0 and start_idx is not None:
+                    candidate = s[start_idx:i+1]
+                    # Only accept well-formed JSON objects
+                    try:
+                        json.loads(candidate)
+                        parts.append(candidate)
+                        start_idx = None
+                    except Exception:
+                        # fall through; we'll bail out below
+                        pass
+
+        # If we found multiple valid objects, return them
+        if len(parts) > 1:
+            return parts
+
+        # Otherwise, return original text
+        return [text]
 
 
 class LLMOrchestrator:
@@ -582,10 +680,9 @@ class LLMOrchestrator:
         except Exception:
             pass
 
-        # Ensure LiteLLM sees any configured alias map on the config, if present
+        # Handle model aliases if configured
         try:
             if hasattr(self.config, 'model_aliases') and self.config.model_aliases:
-                # Delegate aliasing to LiteLLM
                 setattr(litellm, 'model_alias_map', dict(self.config.model_aliases))
         except Exception:
             pass
@@ -600,47 +697,56 @@ class LLMOrchestrator:
             show_header = (tool_cycles == 0)
             assistant_msg = await self._call_llm_streaming(show_header)
 
+            # Always collect the assistant's content
             if assistant_msg.get("content"):
                 final_response.append(assistant_msg["content"])
 
             self.conversation.append(assistant_msg)
 
+            # Check for tool calls
             tool_calls = assistant_msg.get("tool_calls", [])
             if not tool_calls:
                 break
 
+            # Display tool requests
             print("\n" + THEME.sep("Tools request"))
             for i, tc in enumerate(tool_calls, 1):
                 name = tc.get("function", {}).get("name", "")
                 args = tc.get("function", {}).get("arguments", "{}")
-                print(f"  [{i}] {THEME.bold(THEME.blue(name))} {THEME.gray(args)}", flush=True)
+                print(f"  [{i:02d}] {THEME.bold(THEME.blue(name))} {THEME.gray(args)}", flush=True)
             
+            # Execute tools
             results = await self.executor.execute_batch(tool_calls)
 
+            # Sort results to match original tool call order
             id_order: Dict[str, int] = {}
             for idx, tc in enumerate(tool_calls):
                 tc_id = tc.get("id") or f"call_{idx}"
                 id_order[tc_id] = idx
             results_sorted = sorted(results, key=lambda r: id_order.get(r.tool_call_id, 10**9))
 
+            # Display tool results
             print(THEME.sep("Tools results"))
             for i, r in enumerate(results_sorted, 1):
                 status = "ok" if r.success else "error"
                 status_colored = THEME.green(status) if r.success else THEME.red(status)
-                idx_label = THEME.bold(f"[{i}]")
+                idx_label = THEME.bold(f"[{i:02d}]")
                 print(f"← {idx_label} {THEME.bold(THEME.blue(r.name))}: {status_colored} ({r.duration:.2f}s) [{r.lines} lines]", flush=True)
 
+                # Show preview if configured
                 if self.config.tool_preview_lines > 0 and r.success:
                     preview = '\n'.join(r.content.splitlines()[:self.config.tool_preview_lines])
                     if preview:
                         print(THEME.gray(preview), flush=True)
 
+            # Add tool results to conversation
             for result in results_sorted:
                 self.conversation.append(result.to_message())
 
             print("\n" + THEME.label("[Assistant]", "cyan"), end=" ", flush=True)
             tool_cycles += 1
 
+        # If we hit the tool hop limit, get a final response without tools
         if tool_cycles >= self.config.max_tool_hops and tool_calls:
             final_msg = await self._call_llm_streaming(False, allow_tools=False)
             if final_msg.get("content"):
@@ -681,22 +787,20 @@ class LLMOrchestrator:
         parser = StreamParser()
         stream = await litellm.acompletion(**kwargs)
         header_shown = False
-        suppress_content = False
 
         try:
             async for chunk in stream:
                 content = parser.process_chunk(chunk)
 
-                if parser.tool_calls and not suppress_content:
-                    suppress_content = True
-
-                if content and not suppress_content:
+                # Always show content to user as it streams
+                if content:
                     if show_header and not header_shown:
                         print("\n" + THEME.label("[Assistant]", "cyan"), end=" ", flush=True)
                         header_shown = True
                     print(content, end="", flush=True)
 
-            if header_shown or (show_header and not suppress_content and not parser.tool_calls):
+            # Add a newline after streaming content (if any content was shown)
+            if header_shown or (show_header and parser.content_buffer):
                 if not header_shown and show_header:
                     print("\n" + THEME.label("[Assistant]", "cyan"), end=" ", flush=True)
                 print(flush=True)
