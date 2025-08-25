@@ -30,9 +30,12 @@ Prereqs
   - Node.js (for `npx @modelcontextprotocol/server-filesystem`)
   - Docker (for the sample SQLite MCP container)
 
-Install
+Install uv with 
+``` Windows
+powershell -ExecutionPolicy ByPass -c "irm https://astral.sh/uv/install.ps1 | iex"
 ```
-pip install -U litellm mcp openai anthropic google
+```unix - Use wget or curl
+< wget -q0- > or < curl -LsSf > https://astral.sh/uv/install.sh | sh
 ```
 
 Configure providers
@@ -71,9 +74,9 @@ Ensure `mcp_config.json` exists in the repo root (a starter is provided):
 
 Run
 ```
-python client.py                                # Default model
-python client.py -o                             # OpenAI default model
-python client.py --config mcp_config.json --model openai/gpt-4o-mini 
+uv run client.py                                # Default model
+uv run client.py -o                             # OpenAI default model
+uv run client.py --config mcp_config.json --model openai/gpt-4o-mini 
 ```
 
 You should see something like:
@@ -104,7 +107,7 @@ Commands
 
 CLI flags
 ```
-python client.py --help
+uv run client.py --help
 
 --config PATH                    Path to mcp_config.json
 --model NAME                     Model name or alias
