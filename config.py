@@ -1,7 +1,6 @@
 
 import os
 import pathlib
-import yaml
 from dataclasses import dataclass, field
 from typing import Dict, Any, Optional, List, Tuple
 
@@ -55,32 +54,14 @@ class AppConfig:
     system_prompt: str = "You are a helpful assistant."
     log_level: str = "INFO"
     log_json: bool = False
+    use_color: bool = True
 
     model_aliases: Dict[str, str] = field(default_factory=dict)
     
     @classmethod
     def load(cls, 
-             yaml_path: Optional[pathlib.Path] = None,
-             cli_args: Optional[Dict[str, Any]] = None,
-             legacy_prompt_path: Optional[pathlib.Path] = None) -> 'AppConfig':
+             cli_args: Optional[Dict[str, Any]] = None) -> 'AppConfig':
         config = cls()
-
-        if yaml_path and yaml_path.exists():
-            try:
-                with open(yaml_path, 'r', encoding='utf-8') as f:
-                    yaml_data = yaml.safe_load(f) or {}
-
-                config.model_aliases = yaml_data.get('model_aliases', {})
-
-                for key in [k for k in dir(config) if not k.startswith('_') and k != 'model_aliases']:
-                    if key in yaml_data and yaml_data[key] is not None:
-                        setattr(config, key, yaml_data[key])
-
-                if 'system_prompt' in yaml_data:
-                    config.system_prompt = yaml_data['system_prompt']
-
-            except Exception as e:
-                print(f"[Warn] Could not read {yaml_path}: {e}")
 
         if cli_args:
             if cli_args.get('provider'):
@@ -103,17 +84,13 @@ class AppConfig:
 
             for key in ['max_tokens', 'max_tool_hops', 'tool_result_max_chars',
                        'tool_timeout_seconds', 'max_parallel_tools', 'tool_preview_lines',
-                       'log_level', 'log_json']:
+                       'log_level', 'log_json', 'use_color']:
                 if key in cli_args and cli_args[key] is not None:
                     setattr(config, key, cli_args[key])
 
-        if (not config.system_prompt or config.system_prompt == "You are a helpful assistant."):
-            if legacy_prompt_path and legacy_prompt_path.exists():
-                try:
-                    config.system_prompt = legacy_prompt_path.read_text(encoding='utf-8')
-                    print("[Info] Using legacy prompt.txt; consider moving to tinyclient_config.yaml")
-                except Exception:
-                    pass
+            # Respect NO_COLOR env var if CLI did not explicitly set use_color
+            if (('use_color' not in cli_args) or (cli_args.get('use_color') is None)) and os.getenv('NO_COLOR'):
+                config.use_color = False
 
         config.max_tokens = config._apply_token_cap(config.model, config.max_tokens)
         
@@ -128,9 +105,8 @@ class AppConfig:
                 return cap
         return requested_tokens
     
-    def reload(self, yaml_path: Optional[pathlib.Path] = None,
-               cli_args: Optional[Dict[str, Any]] = None) -> None:
-        new_config = self.load(yaml_path, cli_args)
+    def reload(self, cli_args: Optional[Dict[str, Any]] = None) -> None:
+        new_config = self.load(cli_args)
 
         for key in dir(new_config):
             if not key.startswith('_'):

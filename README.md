@@ -1,49 +1,60 @@
-## tinyclient — MCP x LiteLLM single-file chat
+Assistant (LiteLLM + MCP CLI)
+================================
 
-Tiny, battery-included REPL that connects LiteLLM to one or more MCP servers over stdio. It lists tools, namespaces them by server, streams assistant output, and executes tool calls with retries, timeouts, and bounded parallelism.
+Minimal, fast CLI that streams responses from an LLM (via LiteLLM) and executes Model Context Protocol (MCP) tools over stdio. It auto-discovers tools from configured MCP servers and exposes them to the model as OpenAI-style function tools. Built for reliability: parallel tool calls, timeouts, truncation, and duplicate-call prevention.
 
-### Why you might want this
-- **One file**: drop `tinyclient.py` anywhere, no framework.
-- **Real tools**: speak MCP; run any stdio MCP server you point at.
-- **Great UX**: streaming tokens, live tool call logs, `/reload` without restart.
+Why this exists
+----------------
+- Simple: a single Python script wired to LiteLLM and MCP
+- Productive: live streaming output, tooling discovery, and batch tool execution
+- Practical: provider auto-detect, token caps, structured tool results, and sane defaults
 
-### Requirements
-- **Python**: 3.10+ (developed and tested on 3.13)
-- **Pip packages**: `pip install -U litellm mcp pyyaml`
-- **Provider key(s)**: set one or more of `OPENAI_API_KEY`, `ANTHROPIC_API_KEY`, `GEMINI_API_KEY`/`GOOGLE_API_KEY`, `GROQ_API_KEY`
-- **Your MCP servers**: whatever you reference in `mcp_config.json` (Node for filesystem server, Docker for others, etc.)
+Features
+--------
+- Streaming assistant output with tool-call suppression to avoid half-answers
+- MCP server discovery from `mcp_config.json` (stdio transport)
+- Namespaced tool exposure to the LLM (e.g., `filesystem_readFile`)
+- Parallel tool execution with semaphore control and per-call timeout
+- Tool result truncation and preview printing
+- Duplicate tool-call prevention per batch
+- Provider detection (OpenAI, Anthropic, Gemini, Groq) and `max_tokens` capping
+- Basic usage metrics (tokens and total cost if available)
 
-### Quick start
-```bash
-# 1) Install deps
-pip install -U litellm mcp pyyaml
+Quickstart
+----------
 
-# 2) Put a config next to tinyclient.py
-echo {"mcpServers":{}} > mcp_config.json  # fill this in; see below
+Prereqs
+- Python 3.13+
+- One or more provider API keys (depending on your chosen model)
+- For the sample MCP servers:
+  - Node.js (for `npx @modelcontextprotocol/server-filesystem`)
+  - Docker (for the sample SQLite MCP container)
 
-# 3) Set an API key (example: Groq)
-export GROQ_API_KEY=sk-...
-
-# 4) Run
-python tinyclient.py
+Install
+```
+pip install -U litellm mcp openai anthropic google
 ```
 
-Windows (PowerShell) quick start:
-```powershell
-pip install -U litellm mcp pyyaml
-Set-Content -Path mcp_config.json -Value '{"mcpServers":{}}'
-$env:GROQ_API_KEY = 'sk-...'
-python .\tinyclient.py
+Configure providers
+- OpenAI: set `OPENAI_API_KEY`
+- Anthropic: set `ANTHROPIC_API_KEY`
+- Gemini: set `GEMINI_API_KEY` or `GOOGLE_API_KEY`
+- Groq: set `GROQ_API_KEY`
+
+Example (PowerShell):
+```
+$env:OPENAI_API_KEY = "sk-..."
+$env:GROQ_API_KEY = "gsk_..."
 ```
 
-### MCP servers (mcp_config.json)
-Place a `mcp_config.json` next to `tinyclient.py` (or pass `--config`). Example with filesystem and sqlite:
+Configure MCP servers
+Ensure `mcp_config.json` exists in the repo root (a starter is provided):
 ```json
 {
   "mcpServers": {
     "filesystem": {
       "command": "npx",
-      "args": ["-y", "@modelcontextprotocol/server-filesystem", "."]
+      "args": ["-y", "@modelcontextprotocol/server-filesystem", "C:\\workspace\\environment\\Assistant"]
     },
     "sqlite": {
       "command": "docker",
@@ -57,105 +68,101 @@ Place a `mcp_config.json` next to `tinyclient.py` (or pass `--config`). Example 
   }
 }
 ```
-Notes:
-- **filesystem** needs Node.js; `npx @modelcontextprotocol/server-filesystem <root>` exposes a directory.
-- **sqlite** needs Docker; on Windows prefer absolute host paths for `-v`.
-- Tool names are namespaced by server (e.g., `filesystem_list`) and deduped if needed.
 
-### App config (tinyclient_config.yaml)
-Optional file next to `tinyclient.py` for defaults/aliases and runtime settings. CLI flags override YAML.
-```yaml
-system_prompt: |
-  You are a helpful assistant.
-
-model_aliases:
-  # Aliases you can pass via --model
-  "4o-mini": "gpt-4o-mini"
-  "sonnet": "claude-3-7-sonnet-20250219"
-  "pro": "gemini/gemini-2.5-pro"
-  "llamaL": "groq/llama-3.3-70b-versatile"
-
-# Runtime settings (all optional)
-log_level: INFO          # or DEBUG, WARNING, ERROR
-log_json: false          # emit structured logs to stderr
-max_tokens: 4096         # safely capped depending on provider
-max_tool_hops: 25
-tool_result_max_chars: 8000
-tool_timeout_seconds: 45
-max_parallel_tools: 4    # 0=serial, N>0 bounded
-tool_preview_lines: 0    # print first N lines of each tool result
+Run
 ```
-Precedence for the system prompt: `--system-prompt` > `--system-prompt-file` > `tinyclient_config.yaml` > legacy `prompt.txt` (if present) > built-in default.
-Other settings precedence: CLI flag > `tinyclient_config.yaml` > built-in default.
-
-### Run it
-```bash
-# default: reads ./mcp_config.json
-python tinyclient.py
-
-# choose provider defaults quickly
-python tinyclient.py -o   # OpenAI
-python tinyclient.py -a   # Anthropic
-python tinyclient.py -g   # Gemini
-python tinyclient.py -q   # Groq
-
-# override model explicitly (alias or full name)
-python tinyclient.py --model 4o-mini
+python client.py                                # Default model
+python client.py -o                             # OpenAI default model
+python client.py --config mcp_config.json --model openai/gpt-4o-mini 
 ```
 
-REPL commands:
-- `/new`: reset conversation
-- `/history`: dump current messages
-- `/tools`: list servers → tools
-- `/model`: list model aliases from YAML; `/model <alias|full-name>` switches model without adding a message
-- `/reload`: restart servers and re-list tools
-- `/clean`: shutdown; may remove `./data` (helpful for Docker volume examples)
-- `quit`/`exit`: leave
+You should see something like:
+```
+=== LiteLLM MCP CLI Chat ===
+Model: groq/llama-3.3-70b-versatile
+Config: mcp_config.json
+Type 'quit' to exit. Commands: /new, /history, /tools, /model, /reload
+✅ Connected: 2 servers, N tools
+  - filesystem: [...]
+  - sqlite: [...]
 
-### CLI flags
-```text
---config PATH                Path to mcp_config.json
---model NAME                 Model name or alias (e.g., sonnet, gpt-4o-mini)
--o | -a | -g | -q            Provider shortcuts (OpenAI | Anthropic | Gemini | Groq)
---max-tokens N               Max tokens per response (safely capped for some providers)
---max-tool-hops N            Max tool-use hops per user turn
---max-parallel-tools N       0 = serial, N > 0 = bounded concurrency (default 4)
---tool-preview-lines N       Print first N lines of each tool result (0 = off)
---tool-result-max-chars N    Truncate tool results to this many chars (default 8000)
---tool-timeout-seconds SEC   Per tool-call timeout (default 30)
---system-prompt TEXT         Inline system prompt
---system-prompt-file PATH    Load system prompt from file
---log-level LEVEL            DEBUG | INFO | WARNING | ERROR
---log-json                   Emit structured JSON logs to stderr
+[You]
 ```
 
-### What you’ll see
-- Streaming assistant tokens on stdout.
-- Tool calls logged as they happen: `→ [n] server_tool {args}`.
-- Summaries when tools resolve: `← [n] server_tool: ok (1.23s) [42 lines]`.
-- Tool results are fed back to the model (truncated to `--tool-result-max-chars`).
+Usage
+-----
+Type a prompt at `[You]`. The assistant will stream output. If the model decides to call tools, the text is suppressed until tools complete; then the conversation continues.
 
-### Provider/auth notes
-- The client infers provider from the model name and requires relevant env vars:
-  - OpenAI → `OPENAI_API_KEY`
-  - Anthropic → `ANTHROPIC_API_KEY`
-  - Gemini → `GEMINI_API_KEY` or `GOOGLE_API_KEY`
-  - Groq → `GROQ_API_KEY`
-- Gemini ADC gotcha: if you hit Google ADC errors you’re on a Vertex path. Prefer AI Studio with `gemini/<model>` and `GEMINI_API_KEY`, or explicitly use Vertex via provider-prefixed models.
+Commands
+- `/new` reset the conversation
+- `/history` print conversation JSON
+- `/tools` list discovered tools per MCP server
+- `/model` show current model and (if configured) aliases
+- `/model <alias|full>` switch model (env must be set for that provider)
+- `/reload` reconnect to MCP servers and rebuild tool list
+- `/quit` or `/exit` exit
 
-### Implementation details
-- MCP servers are spawned via stdio. Tool input schemas must be JSON Schema objects.
-- Tools are converted to OpenAI-style function tools and namespaced `<server>_<tool>`.
-- Multi-hop tool use with retry/backoff on LLM calls; bounded tool concurrency (`--max-parallel-tools`).
-- Safe token caps per provider to avoid over-asking.
+CLI flags
+```
+python client.py --help
 
-### Troubleshooting
-- Config missing: create or pass `--config`.
-- Command not found: ensure `command` in `mcp_config.json` exists on PATH.
-- No tools loaded: your server may have started without tools or failed to init.
-- Timeouts: raise `--tool-timeout-seconds` or inspect server logs.
-- Windows + Docker: use absolute host paths for `-v` mounts.
+--config PATH                    Path to mcp_config.json
+--model NAME                     Model name or alias
+-o | -a | -g | -q                OpenAI | Anthropic | Gemini | Groq defaults
+--max-tokens N                   Max response tokens (capped per provider)
+--max-tool-hops N                Max tool iterations per user turn (default 50)
+--tool-result-max-chars N        Truncate tool results (default 8000)
+--tool-timeout-seconds S         Per-tool timeout (default 30s)
+--max-parallel-tools N           Parallel tool calls (default 4; 0=serial)
+--tool-preview-lines N           Print first N lines of tool results to console
+--system-prompt TEXT             System prompt inline
+--system-prompt-file PATH        System prompt from file
+--log-level LEVEL                DEBUG|INFO|WARNING|ERROR
+--log-json                       (reserved) emit JSON logs (see roadmap)
+```
 
-### License
-Unlicensed. Add your own license file if you plan to distribute.
+Configuration details
+---------------------
 
+Providers and models
+- Defaults: see `config.py:DEFAULTS`
+- Provider detection: prefix/keyword heuristics (`detect_provider`)
+- Token caps per provider: `config.py:PROVIDERS[*].max_tokens_cap`; enforced by `_apply_token_cap`
+
+Environment variables
+- OpenAI: `OPENAI_API_KEY`
+- Anthropic: `ANTHROPIC_API_KEY`
+- Gemini: `GEMINI_API_KEY` or `GOOGLE_API_KEY`
+- Groq: `GROQ_API_KEY`
+
+MCP servers (`mcp_config.json`)
+- Each entry must specify `command` and `args`; optional `env` with string values
+- Commands resolve either as absolute paths or via `PATH`
+- Tool names are exposed as `<server>_<tool>` to the model
+
+How it works (internals)
+------------------------
+- `MCPRouter` starts all MCP servers (stdio) and collects their tools and JSON schemas
+- Tools are exposed to LiteLLM as OpenAI-style `tools` entries
+- `LLMOrchestrator` streams completions, captures partial tool_calls, and batches execution via `ToolExecutor`
+- Tool outputs are formatted and appended back to the conversation as `role=tool` messages
+- The loop continues up to `max_tool_hops` or until no tools are requested
+
+Troubleshooting
+---------------
+- Missing API credentials
+  - On start: `[Fatal] Missing API credentials: ...` → export the env var(s) for your provider
+- No MCP tools discovered
+  - Run `/tools` to verify; check `mcp_config.json`; ensure `npx`/`docker` on PATH
+- Docker volume path on Windows
+  - `./data:/mcp` is relative to current working directory; create `data` folder or use an absolute path
+- Streaming shows nothing after `[Assistant]`
+  - The model emitted tool_calls; output is suppressed until tools finish. Increase `--tool-timeout-seconds` or check server health
+- Tool output too long
+  - Increase `--tool-result-max-chars` or enable `--tool-preview-lines` to see a snippet
+
+
+Code layout
+- `client.py` runtime, CLI, MCP orchestration, streaming, tool execution
+- `config.py` defaults, provider detection, token caps, metrics helpers
+- `mcp_config.json` sample MCP server setup (filesystem + sqlite)
