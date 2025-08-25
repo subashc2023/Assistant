@@ -18,6 +18,7 @@ import pathlib
 import argparse
 import time
 import re
+import textwrap
 from typing import Any, Dict, List, Optional, Tuple
 from dataclasses import dataclass
 from contextlib import AsyncExitStack
@@ -864,15 +865,32 @@ class LLMOrchestrator:
                     if show_header and not header_shown:
                         print("\n" + label, end="", flush=True)
                         header_shown = True
-                    # Apply hanging indent to multi-line chunks
-                    if "\n" in content:
-                        lines = content.splitlines(True)
-                        if lines:
-                            print(lines[0], end="", flush=True)
-                            for seg in lines[1:]:
-                                print("\n" + indent + seg.lstrip("\n"), end="", flush=True)
-                    else:
-                        print(content, end="", flush=True)
+
+                    # Terminal width and available columns after label
+                    try:
+                        term_width = shutil.get_terminal_size(fallback=(80, 20)).columns
+                    except Exception:
+                        term_width = 80
+                    avail = max(10, term_width - len(plain_label))
+                    wrapper = textwrap.TextWrapper(
+                        width=avail,
+                        break_long_words=True,
+                        break_on_hyphens=False,
+                        replace_whitespace=False,
+                        drop_whitespace=False,
+                    )
+
+                    for piece in content.splitlines(True):
+                        has_nl = piece.endswith("\n")
+                        piece_no_nl = piece.rstrip("\n")
+                        if piece_no_nl:
+                            wrapped = wrapper.wrap(piece_no_nl)
+                            if wrapped:
+                                print(wrapped[0], end="", flush=True)
+                                for wline in wrapped[1:]:
+                                    print("\n" + indent + wline, end="", flush=True)
+                        if has_nl:
+                            print("\n" + indent, end="", flush=True)
 
             # Add a newline after streaming content (if any content was shown)
             if header_shown or (show_header and parser.content_buffer):

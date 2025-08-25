@@ -3,6 +3,10 @@ Assistant (LiteLLM + MCP CLI)
 
 Minimal, fast CLI that streams responses from an LLM (via LiteLLM) and executes Model Context Protocol (MCP) tools over stdio. It auto-discovers tools from configured MCP servers and exposes them to the model as OpenAI-style function tools. Built for reliability: parallel tool calls, timeouts, and result truncation.
 
+Supports MCP in two ways:
+- Local Python MCP servers discovered from the `servers/` directory
+- Configured MCP servers via `mcp_config.json` (e.g., npx and Docker commands)
+
 Why this exists
 ----------------
 - Simple: a single Python script wired to LiteLLM and MCP
@@ -13,7 +17,7 @@ Why this exists
 Features
 --------
 - Streaming assistant output with tool-call suppression to avoid half-answers
-- MCP server discovery from `mcp_config.json` (stdio transport)
+- MCP server discovery from `mcp_config.json` and from local `servers/*.py` (stdio transport)
 - Namespaced tool exposure to the LLM (e.g., `filesystem_readFile`)
 - Parallel tool execution with semaphore control and per-call timeout
 - Tool result truncation and preview printing
@@ -106,6 +110,24 @@ Ensure `mcp_config.json` exists in the repo root (a starter is already provided)
   }
 }
 ```
+
+Local Python MCP servers (auto-discovery)
+-----------------------------------------
+Place Python MCP servers in the `servers/` folder at the repo root. Each `*.py` file (excluding `__init__.py`) will be auto-discovered and launched with your current Python interpreter via stdio.
+
+Rules and behavior:
+- The server name is the filename stem. Example: `servers/weather.py` -> server name `weather`.
+- Discovered servers are merged with `mcp_config.json`. If a name conflict exists, the config entry wins.
+- Discovery looks in `./servers` (next to `mcp_config.json`) and also next to `client.py`.
+- No extra config needed; environment variables are inherited.
+
+Example layout:
+```
+servers/
+  weather.py   # exposes tools with FastMCP/stdio; becomes `weather_*` tools
+```
+
+You can run the client and see discovered servers in the startup summary and via `/tools`.
 
 You should see something like:
 ```
@@ -209,6 +231,11 @@ MCP servers (`mcp_config.json`)
 - Commands resolve either as absolute paths or via `PATH`
 - Tool names are exposed as `<server>_<tool>` to the model
 
+Local MCP servers (`servers/*.py`)
+- Auto-discovered and executed with `sys.executable` over stdio
+- Name is derived from file stem; tools are exposed as `<server>_<tool>`
+- Overrides: entries in `mcp_config.json` take precedence on name conflicts
+
 How it works (internals)
 ------------------------
 - `MCPRouter` starts all MCP servers (stdio) and collects their tools and JSON schemas
@@ -222,7 +249,7 @@ Troubleshooting
 - Missing API credentials
   - On start: `[Fatal] Missing API credentials: ...` → export the env var(s) for your provider
 - No MCP tools discovered
-  - Run `/tools` to verify; check `mcp_config.json`; ensure `npx`/`docker` on PATH
+  - Run `/tools` to verify; check `mcp_config.json`; ensure `npx`/`docker` on PATH; ensure your `servers/` directory exists and contains valid `*.py`
 - Docker volume path on Windows
   - `./data:/mcp` is relative to current working directory; create `data` folder or use an absolute path
 - Streaming shows nothing after `[Assistant]`
