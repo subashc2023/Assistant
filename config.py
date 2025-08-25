@@ -145,6 +145,23 @@ class AppConfig:
             if not key.startswith('_'):
                 setattr(self, key, getattr(new_config, key))
 
+    def resolve_effective_model(self, model: Optional[str] = None) -> str:
+        """Resolve a model alias to the concrete LiteLLM model string.
+
+        Priority order:
+        1) litellm.model_alias_map (runtime source of truth per LiteLLM docs)
+        2) local config.model_aliases fallback
+        3) return the input name unchanged
+        """
+        name = model or self.model
+        try:
+            alias_map = getattr(litellm, 'model_alias_map', {}) or {}
+            if name in alias_map:
+                return alias_map[name]
+        except Exception:
+            pass
+        return self.model_aliases.get(name, name)
+
 
 @dataclass
 class Metrics:

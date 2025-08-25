@@ -678,8 +678,11 @@ class LLMOrchestrator:
             messages.append({"role": "system", "content": self.config.system_prompt})
         messages.extend(self.conversation)
 
+        # Resolve model aliases locally to avoid provider detection issues upstream
+        effective_model = self.config.resolve_effective_model(self.config.model)
+
         kwargs = {
-            "model": self.config.model,
+            "model": effective_model,
             "messages": messages,
             "max_tokens": self.config.max_tokens,
             "stream": True
@@ -782,7 +785,8 @@ class CommandHandler:
 
         elif command == '/model':
             if not args:
-                print(f"Current model: {self.config.model}")
+                effective = self.config.resolve_effective_model(self.config.model)
+                print(f"Current model: {self.config.model} -> {effective}")
                 alias_map = getattr(litellm, 'model_alias_map', {}) or {}
                 if alias_map:
                     print("Available aliases:")
@@ -791,9 +795,8 @@ class CommandHandler:
             else:
                 # Just set the model directly - LiteLLM will resolve aliases
                 model = args
-                # For auth checking, we need to resolve the alias to check the right provider
-                alias_map = getattr(litellm, 'model_alias_map', {}) or {}
-                effective_model = alias_map.get(model, model)
+                # For auth checking, resolve alias to check the right provider
+                effective_model = self.config.resolve_effective_model(model)
                 ok, missing = check_provider_auth(effective_model)
                 if not ok:
                     print(f"[Error] Missing API keys: {', '.join(missing)}")
@@ -801,7 +804,7 @@ class CommandHandler:
                     self.config.model = model  # Store the alias/model as-is
                     # Apply token cap based on resolved model
                     self.config.max_tokens = self.config._apply_token_cap(effective_model, self.config.max_tokens)
-                    print(f"[Info] Switched to {model}")
+                    print(f"[Info] Switched to {model} -> {effective_model}")
         
         elif command == '/reload':
             print(self.theme.label("[Info]", "blue") + " Reloading MCP servers...")
@@ -856,14 +859,15 @@ async def amain(args: argparse.Namespace) -> None:
     # Create theme based on config
     theme = create_theme(config)
 
-    # Check auth using the model (LiteLLM will resolve alias if needed)
-    ok, missing = check_provider_auth(config.model)
+    # Check auth using the resolved model
+    effective_model = config.resolve_effective_model(config.model)
+    ok, missing = check_provider_auth(effective_model)
     if not ok:
         print(f"[Fatal] Missing API credentials: {', '.join(missing)}")
         sys.exit(1)
 
     print(theme.sep("LiteLLM MCP CLI Chat"))
-    print(f"{theme.label('[Model]', 'magenta')} {config.model}")
+    print(f"{theme.label('[Model]', 'magenta')} {config.model} -> {effective_model}")
     print(f"{theme.label('[Config]', 'magenta')} {args.config}")
     print(theme.gray("Type '/quit' or '/exit' to exit. Commands: /new, /history, /tools, /model, /reload, /quit"))
 
