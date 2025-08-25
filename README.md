@@ -94,7 +94,8 @@ Type 'quit' to exit. Commands: /new, /history, /tools, /model, /reload
 
 Usage
 -----
-Type a prompt at `[You]`. The assistant will stream output. If the model decides to call tools, the text is suppressed until tools complete; then the conversation continues.
+Type a prompt at `[You]`. The assistant will stream output. 
+Note : LiteLLM Does not stream tool calls, as some of its constituent providers do not support this feature. :(
 
 Commands
 - `/new` reset the conversation

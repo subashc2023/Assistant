@@ -335,7 +335,6 @@ class ToolResult:
             "content": meta + self.content
         }
 
-
 class ToolExecutor:
 
     def __init__(self, router: MCPRouter, config: AppConfig):
@@ -356,7 +355,6 @@ class ToolExecutor:
             name = tc.get("function", {}).get("name", "")
             args_str = tc.get("function", {}).get("arguments", "{}")
             tool_call_id = tc.get("id", f"tc_{len(tasks)}")
-
 
             call_key = (name, args_str)
             if call_key in self.seen_calls:
@@ -384,8 +382,7 @@ class ToolExecutor:
     
     async def _execute_single(self, name: str, args_str: str,
                              tool_call_id: str, sem: Optional[asyncio.Semaphore]) -> ToolResult:
-        try:
-            # Some providers send already-serialized JSON strings; try parse, else treat as raw string.
+        try:# Some providers send already-serialized JSON strings; try parse, else treat as raw string.
             args = json.loads(args_str) if (isinstance(args_str, str) and args_str.strip()) else {}
         except json.JSONDecodeError:
             return ToolResult(
@@ -558,10 +555,7 @@ class StreamParser:
             for idx in sorted(self.tool_calls.keys()):
                 tc = self.tool_calls[idx].copy()
                 tc['id'] = tc.get('id') or f'call_{idx}'
-                # OpenAI-compatible streaming can yield arguments in chunks; join safely.
                 args_concat = ''.join(self.tool_args_buffer.get(idx, []))
-                # If the chunks formed a valid JSON object/array, keep as-is string (model expects string).
-                # Otherwise, just pass the raw concatenated string.
                 tc['function']['arguments'] = args_concat
                 tool_calls.append(tc)
             
@@ -629,7 +623,6 @@ class LLMOrchestrator:
             
             results = await self.executor.execute_batch(tool_calls)
 
-            # Order results to match the original tool_calls order
             id_order: Dict[str, int] = {}
             for idx, tc in enumerate(tool_calls):
                 tc_id = tc.get("id") or f"call_{idx}"
@@ -834,8 +827,7 @@ async def amain(args: argparse.Namespace) -> None:
     )
 
     configure_logging(config)
-
-    # Configure ANSI theme based on config and TTY
+    
     try:
         global THEME
         THEME.enabled = bool(getattr(config, 'use_color', True) and sys.stdout.isatty())
