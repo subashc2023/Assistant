@@ -134,6 +134,73 @@ def configure_logging(config: AppConfig) -> None:
     except Exception:
         pass
 
+class HangingIndentWriter:
+
+    def __init__(self, indent: str, width: int):
+        self.indent = indent
+        self.width = max(1, width)
+        self.col = 0  # current column count on this visual line (after indent)
+        self.buf: List[str] = []  # accumulation buffer per external flush
+        self.at_line_start = True
+
+    def _emit(self, s: str) -> None:
+        if s:
+            self.buf.append(s)
+
+    def _wrap_line(self) -> None:
+        self._emit("\n")
+        self._emit(self.indent)
+        self.col = 0
+        self.at_line_start = True
+
+    def feed(self, text: str) -> None:
+        # Handle CRLF by ignoring CR
+        text = text.replace("\r", "")
+        pos = 0
+        while True:
+            nl = text.find("\n", pos)
+            segment = text[pos:] if nl == -1 else text[pos:nl]
+            self._process_segment(segment)
+            if nl == -1:
+                break
+            # explicit newline
+            self._wrap_line()
+            pos = nl + 1
+
+    def _process_segment(self, segment: str) -> None:
+        if not segment:
+            return
+        # Split into whitespace and non-whitespace tokens (excluding newlines)
+        for tok in re.findall(r"(\s+|\S+)", segment):
+            if tok.isspace():
+                # Collapse any leading spaces at start of a visual line
+                if self.at_line_start or self.col == 0:
+                    continue
+                # Render a single space as separator
+                if self.col + 1 > self.width:
+                    self._wrap_line()
+                self._emit(" ")
+                self.col += 1
+                self.at_line_start = False
+            else:
+                word = tok
+                # If the word won't fit on this line, move it entirely to the next line
+                if self.col > 0 and (self.col + len(word) > self.width):
+                    self._wrap_line()
+                # Emit the whole word without hyphenation/breaking
+                self._emit(word)
+                self.col += len(word)
+                self.at_line_start = False
+                # If it overflows terminal width, keep logical col but do not force breaks;
+                # rare super-long tokens will visually wrap by the terminal.
+
+    def flush_buf(self) -> str:
+        if not self.buf:
+            return ""
+        out = ''.join(self.buf)
+        self.buf.clear()
+        return out
+
 class MCPServer:
 
     def __init__(self, name: str, config: Dict[str, Any]):
@@ -414,9 +481,10 @@ class ToolExecutor:
         results = []
         tasks = []
 
-        sem = None
-        if self.config.max_parallel_tools > 0:
-            sem = asyncio.Semaphore(self.config.max_parallel_tools)
+        limit = self.config.max_parallel_tools
+        if limit is None or limit <= 0:
+            limit = 1
+        sem = asyncio.Semaphore(limit)
         
         for tc in tool_calls:
             name = tc.get("function", {}).get("name", "")
@@ -507,7 +575,9 @@ class ToolExecutor:
                         parts.append(json.dumps(item, indent=2, ensure_ascii=False))
                 text = '\n'.join(parts)
             else:
-                text = json.dumps(result, indent=2, ensure_ascii=False)
+                text, was_truncated = self._json_truncate(result, self.config.tool_result_max_chars)
+                lines = len(text.splitlines())
+                return text or "[empty response]", was_truncated, lines
             
             lines = len(text.splitlines())
 
@@ -524,6 +594,25 @@ class ToolExecutor:
                 text = text[:self.config.tool_result_max_chars]
                 return text, True, lines
             return text, False, lines
+
+    def _json_truncate(self, obj: Any, limit: int) -> Tuple[str, bool]:
+        try:
+            encoder = json.JSONEncoder(ensure_ascii=False, indent=2)
+            parts: List[str] = []
+            total = 0
+            for chunk in encoder.iterencode(obj):
+                parts.append(chunk)
+                total += len(chunk)
+                if total >= limit:
+                    s = ''.join(parts)
+                    return s[:limit], True
+            s = ''.join(parts)
+            return s, False
+        except Exception:
+            s = str(obj)
+            if len(s) > limit:
+                return s[:limit], True
+            return s, False
 
 class StreamParser:
 
@@ -857,6 +946,14 @@ class LLMOrchestrator:
         indent = " " * len(plain_label)
 
         try:
+            # Cache terminal width and use a deterministic hanging-indent writer
+            try:
+                term_width = shutil.get_terminal_size(fallback=(80, 20)).columns
+            except Exception:
+                term_width = 80
+            avail = max(10, term_width - len(plain_label))
+            writer = HangingIndentWriter(indent=indent, width=avail)
+
             async for chunk in stream:
                 content = parser.process_chunk(chunk)
 
@@ -865,32 +962,10 @@ class LLMOrchestrator:
                     if show_header and not header_shown:
                         print("\n" + label, end="", flush=True)
                         header_shown = True
-
-                    # Terminal width and available columns after label
-                    try:
-                        term_width = shutil.get_terminal_size(fallback=(80, 20)).columns
-                    except Exception:
-                        term_width = 80
-                    avail = max(10, term_width - len(plain_label))
-                    wrapper = textwrap.TextWrapper(
-                        width=avail,
-                        break_long_words=True,
-                        break_on_hyphens=False,
-                        replace_whitespace=False,
-                        drop_whitespace=False,
-                    )
-
-                    for piece in content.splitlines(True):
-                        has_nl = piece.endswith("\n")
-                        piece_no_nl = piece.rstrip("\n")
-                        if piece_no_nl:
-                            wrapped = wrapper.wrap(piece_no_nl)
-                            if wrapped:
-                                print(wrapped[0], end="", flush=True)
-                                for wline in wrapped[1:]:
-                                    print("\n" + indent + wline, end="", flush=True)
-                        if has_nl:
-                            print("\n" + indent, end="", flush=True)
+                    writer.feed(content)
+                    chunk_out = writer.flush_buf()
+                    if chunk_out:
+                        print(chunk_out, end="", flush=True)
 
             # Add a newline after streaming content (if any content was shown)
             if header_shown or (show_header and parser.content_buffer):
@@ -943,9 +1018,6 @@ class CommandHandler:
             self.orchestrator.conversation.clear()
             print("[Info] Conversation reset")
 
-        elif command == '/history':
-            print(json.dumps(self.orchestrator.conversation, indent=2, ensure_ascii=False))
-
         elif command == '/tools':
             for server, tools in sorted(self.router.get_server_tools_map().items()):
                 print(f"  - {server}: {sorted(tools)}")
@@ -991,7 +1063,7 @@ class CommandHandler:
         
         else:
             print(f"Unknown command: {command}")
-            print("Commands: /new, /history, /tools, /model, /reload, /quit")
+            print("Commands: /new, /tools, /model, /reload, /quit")
         
         return True
 

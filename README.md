@@ -149,7 +149,6 @@ Note : LiteLLM Does not stream tool calls, as some of its constituent providers 
 
 Commands
 - `/new` reset the conversation
-- `/history` print conversation JSON
 - `/tools` list discovered tools per MCP server
 - `/model` show current model and aliases
 - `/model <alias|full>` switch model (env must be set for that provider)
