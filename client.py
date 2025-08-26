@@ -23,6 +23,7 @@ from dataclasses import dataclass
 from contextlib import AsyncExitStack
 
 import litellm
+from litellm.integrations.custom_logger import CustomLogger
 from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client
 
@@ -202,7 +203,19 @@ class MCPServer:
         try:
             await self.exit_stack.aclose()
         except Exception as e:
-            if not (isinstance(e, RuntimeError) and "cancel scope" in str(e)):
+            msg = str(e)
+            benign = (
+                isinstance(e, (RuntimeError, OSError, ConnectionError)) and any(s in msg for s in (
+                    "cancel scope",
+                    "Event loop is closed",
+                    "already closed",
+                    "attached to a different loop",
+                    "cannot schedule new futures",
+                    "I/O operation on closed file",
+                    "Proactor"
+                ))
+            )
+            if not benign:
                 logger.warning("Cleanup warning for '%s': %r", self.name, e)
         finally:
             self.session = None
@@ -596,22 +609,121 @@ class LLMOrchestrator:
         self._register_metrics_callback()
     
     def _register_metrics_callback(self) -> None:
-        def callback(kwargs, response, start_time, end_time):
-            try:
-                usage = getattr(response, 'usage', None) or response.get('usage')
-                if usage:
-                    prompt = getattr(usage, 'prompt_tokens', 0) or usage.get('prompt_tokens', 0)
-                    completion = getattr(usage, 'completion_tokens', 0) or usage.get('completion_tokens', 0)
-                    cost = kwargs.get('response_cost') or getattr(response, 'cost', 0)
-                    self.metrics.update(prompt, completion, cost)
-            except Exception:
-                pass
-        
-        callbacks = getattr(litellm, 'success_callback', [])
-        if not isinstance(callbacks, list):
-            callbacks = [callbacks] if callbacks else []
-        callbacks.append(callback)
-        litellm.success_callback = callbacks
+        orchestrator_metrics = self.metrics
+
+        class _MetricsLogger(CustomLogger):
+            def __init__(self, metrics: Metrics):
+                self.metrics = metrics
+
+            async def async_log_success_event(self, kwargs, response_obj, start_time, end_time):
+                try:
+                    prompt_tokens = 0
+                    completion_tokens = 0
+                    total_cost = 0.0
+
+                    # Prefer complete_streaming_response for streaming calls
+                    full_stream_resp = kwargs.get('complete_streaming_response')
+                    usage_source = full_stream_resp or response_obj
+
+                    # 1) Try usage on object
+                    try:
+                        usage_obj = getattr(usage_source, 'usage', None)
+                        if usage_obj:
+                            prompt_tokens = getattr(usage_obj, 'prompt_tokens', 0) or getattr(usage_obj, 'input_tokens', 0) or 0
+                            completion_tokens = getattr(usage_obj, 'completion_tokens', 0) or getattr(usage_obj, 'output_tokens', 0) or 0
+                    except Exception:
+                        pass
+
+                    # 2) Try dict-style usage
+                    if (prompt_tokens == 0 and completion_tokens == 0) and isinstance(usage_source, dict):
+                        usage_dict = usage_source.get('usage') or {}
+                        if isinstance(usage_dict, dict):
+                            prompt_tokens = usage_dict.get('prompt_tokens') or usage_dict.get('input_tokens') or 0
+                            completion_tokens = usage_dict.get('completion_tokens') or usage_dict.get('output_tokens') or 0
+
+                    # 3) Try kwargs fallbacks (LiteLLM sets these on success)
+                    if prompt_tokens == 0:
+                        prompt_tokens = kwargs.get('prompt_tokens') or kwargs.get('input_tokens') or 0
+                    if completion_tokens == 0:
+                        completion_tokens = kwargs.get('completion_tokens') or kwargs.get('output_tokens') or 0
+
+                    # 4) Cost from kwargs/response
+                    total_cost = kwargs.get('response_cost') or getattr(response_obj, 'cost', 0) or 0.0
+
+                    # 5) Fallback – compute prompt tokens locally if still zero
+                    if prompt_tokens == 0:
+                        try:
+                            model_for_count = kwargs.get('model')
+                            messages_for_count = kwargs.get('messages') or []
+                            if model_for_count and messages_for_count:
+                                prompt_tokens = litellm.token_counter(model=model_for_count, messages=messages_for_count) or 0
+                        except Exception:
+                            pass
+
+                    # 6) Fallback – compute completion tokens from full streamed content if available
+                    if completion_tokens == 0:
+                        try:
+                            model_for_count = kwargs.get('model')
+                            assistant_text = None
+                            if isinstance(usage_source, dict):
+                                # OpenAI-style
+                                try:
+                                    choices = usage_source.get('choices') or []
+                                    if choices:
+                                        choice0 = choices[0] or {}
+                                        msg = choice0.get('message') or {}
+                                        assistant_text = msg.get('content') or assistant_text
+                                        if not assistant_text:
+                                            delta = choice0.get('delta') or {}
+                                            assistant_text = delta.get('content') or assistant_text
+                                except Exception:
+                                    pass
+                                # Anthropic/Groq-style
+                                if assistant_text is None:
+                                    content = usage_source.get('content')
+                                    if isinstance(content, list) and content:
+                                        # [{'type': 'text', 'text': '...'}]
+                                        first = content[0]
+                                        assistant_text = first.get('text') if isinstance(first, dict) else None
+                                    elif isinstance(content, str):
+                                        assistant_text = content
+                            # Compute token count for assistant text
+                            if model_for_count and assistant_text:
+                                completion_tokens = litellm.token_counter(model=model_for_count, text=assistant_text) or \
+                                                    litellm.token_counter(model=model_for_count, messages=[{"role": "assistant", "content": assistant_text}]) or 0
+                        except Exception:
+                            pass
+
+                    if prompt_tokens or completion_tokens or total_cost:
+                        orchestrator_metrics.update(prompt_tokens, completion_tokens, float(total_cost or 0.0))
+                except Exception:
+                    pass
+
+            async def async_log_failure_event(self, kwargs, response_obj, start_time, end_time):
+                # no-op; could record failures if desired
+                return
+
+        # Register the custom logger (overrides previous callbacks to avoid duplicates)
+        try:
+            litellm.callbacks = [_MetricsLogger(orchestrator_metrics)]
+        except Exception:
+            # Fallback to success_callback with async function if CustomLogger import fails
+            async def async_callback(kwargs, response_obj, start_time, end_time):
+                try:
+                    usage = (getattr(response_obj, 'usage', None) or
+                             (response_obj.get('usage') if isinstance(response_obj, dict) else None)) or {}
+                    prompt = getattr(usage, 'prompt_tokens', 0) or (usage.get('prompt_tokens') if isinstance(usage, dict) else 0) or 0
+                    completion = getattr(usage, 'completion_tokens', 0) or (usage.get('completion_tokens') if isinstance(usage, dict) else 0) or 0
+                    if prompt == 0:
+                        try:
+                            prompt = litellm.token_counter(model=kwargs.get('model'), messages=kwargs.get('messages') or []) or 0
+                        except Exception:
+                            pass
+                    cost = kwargs.get('response_cost') or getattr(response_obj, 'cost', 0) or 0.0
+                    orchestrator_metrics.update(prompt, completion, float(cost or 0.0))
+                except Exception:
+                    pass
+            litellm.success_callback = [async_callback]
     
     async def run_turn(self, user_input: str) -> str:
         self.conversation.append({"role": "user", "content": user_input})
@@ -685,7 +797,9 @@ class LLMOrchestrator:
             "model": effective_model,
             "messages": messages,
             "max_tokens": self.config.max_tokens,
-            "stream": True
+            "stream": True,
+            # Ensure providers that support it (e.g., OpenAI) include usage on the final stream chunk
+            "stream_options": {"include_usage": True}
         }
 
         if allow_tools and self.router.tool_specs:
@@ -912,6 +1026,11 @@ async def amain(args: argparse.Namespace) -> None:
             await router.cleanup()
         except Exception as e:
             logger.warning("Cleanup error: %r", e)
+        # Give background tasks/transports a brief moment to settle on shutdown (Windows/proactor)
+        try:
+            await asyncio.sleep(0.05)
+        except Exception:
+            pass
 
         print(f"{theme.label('[Metrics]', 'magenta')} {metrics.summary()}")
 
