@@ -21,6 +21,8 @@ Features
 - Namespaced tool exposure to the LLM (e.g., `filesystem_readFile`)
 - Parallel tool execution with semaphore control and per-call timeout
 - Tool result truncation and preview printing
+- Undo/Redo of conversation turns
+- Redaction of secrets (API keys, tokens) in tool call previews
 - Provider detection (OpenAI, Anthropic, Gemini, Groq) and `max_tokens` capping
 - Basic usage metrics (tokens and total cost if available)
 - Executes duplicate tool calls when requested (no dedup) — supports non-idempotent tools
@@ -134,7 +136,7 @@ You should see something like:
 === LiteLLM MCP CLI Chat ===
 Model: groq/llama-3.3-70b-versatile
 Config: mcp_config.json
-Type '/quit' or '/exit' to exit. Commands: /new, /history, /tools, /model, /reload
+Type '/quit' or '/exit' to exit. Commands: /new, /tools, /model, /reload, /undo, /redo, /quit
 ✅ Connected: 2 servers, N tools
   - filesystem: [...]
   - sqlite: [...]
@@ -153,6 +155,8 @@ Commands
 - `/model` show current model and aliases
 - `/model <alias|full>` switch model (env must be set for that provider)
 - `/reload` reconnect to MCP servers and rebuild tool list
+- `/undo` Reverts the last conversation turn. Your previous input is prefilled.
+- `/redo` Restores the last undone turn.
 - `/quit` or `/exit` exit
 
 CLI flags
@@ -171,7 +175,7 @@ uv run client.py --help
 --system-prompt TEXT             System prompt inline
 --system-prompt-file PATH        System prompt from file
 --log-level LEVEL                DEBUG|INFO|WARNING|ERROR
---log-json                       (reserved) emit JSON logs (see roadmap)
+--log-json                       Output structured JSON logs to stderr
 ```
 
 Built-in model aliases
@@ -229,35 +233,9 @@ MCP servers (`mcp_config.json`)
 - Each entry must specify `command` and `args`; optional `env` with string values
 - Commands resolve either as absolute paths or via `PATH`
 - Tool names are exposed as `<server>_<tool>` to the model
+- Tool input schemas are automatically made strict (`additionalProperties: false`) unless overridden.
 
 Local MCP servers (`servers/*.py`)
 - Auto-discovered and executed with `sys.executable` over stdio
 - Name is derived from file stem; tools are exposed as `<server>_<tool>`
-- Overrides: entries in `mcp_config.json` take precedence on name conflicts
-
-How it works (internals)
-------------------------
-- `MCPRouter` starts all MCP servers (stdio) and collects their tools and JSON schemas
-- Tools are exposed to LiteLLM as OpenAI-style `tools` entries
-- `LLMOrchestrator` streams completions, captures partial tool_calls, and batches execution via `ToolExecutor`
-- Tool outputs are formatted and appended back to the conversation as `role=tool` messages
-- The loop continues up to `max_tool_hops` or until no tools are requested
-
-Troubleshooting
----------------
-- Missing API credentials
-  - On start: `[Fatal] Missing API credentials: ...` → export the env var(s) for your provider
-- No MCP tools discovered
-  - Run `/tools` to verify; check `mcp_config.json`; ensure `npx`/`docker` on PATH; ensure your `servers/` directory exists and contains valid `*.py`
-- Docker volume path on Windows
-  - `./data:/mcp` is relative to current working directory; create `data` folder or use an absolute path
-- Streaming shows nothing after `[Assistant]`
-  - The model emitted tool_calls; output is suppressed until tools finish. Increase `--tool-timeout-seconds` or check server health
-- Tool output too long
-  - Increase `--tool-result-max-chars` or enable `--tool-preview-lines` to see a snippet
-
-
-Code layout
-- `client.py` runtime, CLI, MCP orchestration, streaming, tool execution
-- `config.py` defaults, provider detection, token caps, metrics helpers
-- `mcp_config.json` sample MCP server setup (filesystem + sqlite)
+- Overrides: entries in `mcp_config.json`

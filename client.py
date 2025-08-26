@@ -73,11 +73,11 @@ def generate_tool_call_id(index: int, prefix: str = "call") -> str:
 
 def configure_logging(config: AppConfig) -> None:
     level = getattr(logging, config.log_level, logging.INFO)
-    logging.basicConfig(
-        level=level,
-        format="%(levelname)s %(message)s",
-        force=True
-    )
+    if config.log_json:
+        fmt = '{"level":"%(levelname)s","name":"%(name)s","msg":"%(message)s"}'
+    else:
+        fmt = "%(levelname)s %(message)s"
+    logging.basicConfig(level=level, format=fmt, force=True)
 
     for lib in ['httpx', 'anyio', 'mcp', 'urllib3', 'openai', 'LiteLLM', 'litellm']:
         logging.getLogger(lib).setLevel(logging.WARNING)
@@ -260,7 +260,8 @@ class MCPRouter:
             schema["properties"] = {}
         elif not isinstance(schema["properties"], dict):
             raise ValueError(f"[{server_name}] Tool '{tool_name}' properties must be object")
-        
+        if "additionalProperties" not in schema:
+            schema["additionalProperties"] = False
         return schema
     
     async def call_tool(self, namespaced: str, arguments: Dict[str, Any]) -> Any:
@@ -567,11 +568,16 @@ class LLMOrchestrator:
             for i, tc in enumerate(tool_calls, 1):
                 name = tc.get("function", {}).get("name", "")
                 args = tc.get("function", {}).get("arguments", "{}")
-                print(f"  [{i:02d}] {self.theme.style(name, 'bold', 'blue')} {self.theme.style(args[:120], 'gray')}", flush=True)
+                try:
+                    scrub = re.sub(r'(?i)("?(api[_-]?key|authorization|password|token|secret|bearer)"?\s*:\s*")([^"]+)"',
+                                   r'\1[REDACTED]"', args)
+                except Exception:
+                    scrub = args
+                print(f"  [{i:02d}] {self.theme.style(name, 'bold', 'blue')} {self.theme.style(scrub[:120], 'gray')}", flush=True)
 
             results = await self.executor.execute_batch(tool_calls)
 
-            id_order = {tc.get("id", generate_tool_call_id(i)): i for i, tc in enumerate(tool_calls)}
+            id_order = {tc.get("id", generate_tool_call_id(i, "tc")): i for i, tc in enumerate(tool_calls)}
             results_sorted = sorted(results, key=lambda r: id_order.get(r.tool_call_id, 10**9))
 
             print(self.theme.sep("Tools results"))
@@ -669,11 +675,55 @@ class CommandHandler:
         self.router = router
         self.config = config
         self.theme = theme
-        
+        self._turn_stack: List[Dict[str, Any]] = []
+        self._redo_stack: List[Dict[str, Any]] = []
+        self._pending_prefill: Optional[str] = None
+
         self.valid_commands = {
-            '/quit', '/exit', '/new', '/tools', '/model', '/reload', '/clean'
+            '/quit', '/exit', '/new', '/tools', '/model', '/reload', '/clean', '/undo', '/redo'
         }
-    
+
+    def _read_input_with_prefill(self, prompt: str) -> str:
+        text = self._pending_prefill or ""
+        self._pending_prefill = None
+
+        if not text:
+            return input(prompt).strip()
+
+        try:
+            import readline
+
+            def hook():
+                try:
+                    readline.insert_text(text)
+                    readline.redisplay()
+                except Exception:
+                    pass
+
+            readline.set_pre_input_hook(hook)
+            try:
+                return input(prompt).strip()
+            finally:
+                try:
+                    readline.set_pre_input_hook(None)
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
+        try:
+            from prompt_toolkit import prompt as pt_prompt
+            line = pt_prompt(prompt, default=text)
+            return (line or "").strip()
+        except Exception:
+            pass
+
+        line = input(prompt + text)
+        if line == "":
+            return text
+        return line.strip()
+
+
     async def handle(self, user_input: str) -> bool:
         if not user_input.strip():
             return True
@@ -681,6 +731,7 @@ class CommandHandler:
         if user_input.startswith('/'):
             return await self._handle_command(user_input)
 
+        start_len = len(self.orchestrator.conversation)
         try:
             await self.orchestrator.run_turn(user_input)
         except KeyboardInterrupt:
@@ -690,6 +741,12 @@ class CommandHandler:
             print(self.theme.style(f"[Error] {format_exception(e)}", 'red'))
             import traceback
             traceback.print_exc()
+        else:
+            end_len = len(self.orchestrator.conversation)
+            turn_msgs = self.orchestrator.conversation[start_len:end_len]
+            self._turn_stack.append({"messages": [m.copy() if isinstance(m, dict) else m for m in turn_msgs],
+                                     "user_text": user_input})
+            self._redo_stack.clear()
         
         return True
     
@@ -700,7 +757,7 @@ class CommandHandler:
         
         if command not in self.valid_commands:
             print(f"Unknown command: {command}")
-            print("Commands: /new, /tools, /model, /reload, /quit")
+            print("Commands: /new, /tools, /model, /reload, /undo, /redo, /quit")
             return True
 
         if command in ['/quit', '/exit']:
@@ -709,6 +766,8 @@ class CommandHandler:
 
         elif command == '/new':
             self.orchestrator.conversation.clear()
+            self._turn_stack.clear()
+            self._redo_stack.clear()
             print("[Info] Conversation reset")
 
         elif command == '/tools':
@@ -748,6 +807,28 @@ class CommandHandler:
         elif command == '/clean':
             print("[Info] Cleanup requested")
             return False
+
+        elif command == '/undo':
+            if not self._turn_stack:
+                print(self.theme.style("[Info] Nothing to undo", 'yellow'))
+                return True
+            record = self._turn_stack.pop()
+            msgs = record["messages"]
+            remove_n = len(msgs)
+            if remove_n > 0 and len(self.orchestrator.conversation) >= remove_n:
+                del self.orchestrator.conversation[-remove_n:]
+            self._pending_prefill = record["user_text"]
+            self._redo_stack.append(record)
+            print(self.theme.style("[Info] Undid last turn. Your previous input will be prefilled next.", 'gray'))
+
+        elif command == '/redo':
+            if not self._redo_stack:
+                print(self.theme.style("[Info] Nothing to redo", 'yellow'))
+                return True
+            record = self._redo_stack.pop()
+            self.orchestrator.conversation.extend(record["messages"])
+            self._turn_stack.append(record)
+            print(self.theme.style("[Info] Redid last undone turn.", 'gray'))
         
         return True
 
@@ -825,7 +906,7 @@ async def amain(args: argparse.Namespace) -> None:
 
         while True:
             try:
-                user_input = input("\n" + theme.label("[You]", "green") + " ").strip()
+                user_input = handler._read_input_with_prefill("\n" + theme.label("[You]", "green") + " ")
             except (EOFError, KeyboardInterrupt):
                 print("\n👋 Bye.")
                 break
