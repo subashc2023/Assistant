@@ -20,6 +20,7 @@ import argparse
 import time
 import re
 from typing import Any, Dict, List, Optional, Tuple, Callable
+import threading
 from dataclasses import dataclass
 from contextlib import AsyncExitStack
 
@@ -39,7 +40,8 @@ from config import AppConfig, Metrics, check_provider_auth
 
 SCRIPT_DIR = pathlib.Path(__file__).parent.resolve()
 MCP_CONFIG_FILE = SCRIPT_DIR / "mcp_config.json"
-HISTORY_FILE = SCRIPT_DIR / ".chat_history"
+DATA_DIR = SCRIPT_DIR / "data"
+HISTORY_FILE = DATA_DIR / ".chat_history"
 
 logger = logging.getLogger(__name__)
 
@@ -100,6 +102,44 @@ def create_theme(config: AppConfig) -> AnsiTheme:
     enabled = config.use_color and sys.stdout.isatty()
     return AnsiTheme(enabled=enabled)
 
+class EscWatcher:
+    """Windows-only ESC key watcher running in a background thread.
+    Calls the provided callback on ESC press. Start/stop controlled externally.
+    """
+    def __init__(self, on_escape: Callable[[], None]):
+        self.on_escape = on_escape
+        self._stop_flag = threading.Event()
+        self._thread: Optional[threading.Thread] = None
+
+    def start(self) -> None:
+        if self._thread and self._thread.is_alive():
+            return
+        self._stop_flag.clear()
+        self._thread = threading.Thread(target=self._run, daemon=True)
+        self._thread.start()
+
+    def stop(self) -> None:
+        self._stop_flag.set()
+
+    def _run(self) -> None:
+        try:
+            import msvcrt  # type: ignore
+        except Exception:
+            return
+        while not self._stop_flag.is_set():
+            try:
+                if msvcrt.kbhit():
+                    ch = msvcrt.getwch()
+                    if ch == '\x1b':  # ESC
+                        try:
+                            self.on_escape()
+                        except Exception:
+                            pass
+                time.sleep(0.03)
+            except Exception:
+                # Best-effort; ignore and keep loop
+                time.sleep(0.05)
+
 class MCPServer:
     def __init__(self, name: str, config: Dict[str, Any]):
         self.name = name
@@ -119,7 +159,7 @@ class MCPServer:
             read, write = stdio_transport
             self.session = await self.exit_stack.enter_async_context(ClientSession(read, write))
             await self.session.initialize()
-            logger.info("Server '%s' initialized", self.name)
+            logger.debug("Server '%s' initialized", self.name)
         except (OSError, ConnectionError) as e:
             logger.error("Error initializing server '%s': %r", self.name, e)
             await self.cleanup()
@@ -178,6 +218,8 @@ class MCPRouter:
         self.tool_specs: List[Dict[str, Any]] = []
         self.tool_to_server: Dict[str, MCPServer] = {}
         self.tool_name_map: Dict[str, str] = {}
+        self.configured_servers_count: int = 0
+        self.local_servers_count: int = 0
 
     async def load_and_start(self, config_path: pathlib.Path) -> None:
         with open(config_path, "r", encoding="utf-8") as f:
@@ -188,9 +230,14 @@ class MCPRouter:
             raise ValueError("mcp_config.json must contain 'mcpServers' object (dict) if present")
 
         discovered = self._discover_local_servers(config_path)
+        original_config_names = set(raw_servers.keys())
         for name, cfg in discovered.items():
             if name not in raw_servers:
                 raw_servers[name] = cfg
+
+        # Track counts: configured vs local (non-conflicting) servers
+        self.configured_servers_count = len(original_config_names)
+        self.local_servers_count = sum(1 for n in discovered.keys() if n not in original_config_names)
 
         if not raw_servers:
             raise ValueError("No MCP servers found (neither in mcp_config.json nor in ./servers)")
@@ -208,7 +255,7 @@ class MCPRouter:
         if not self.tool_specs:
             logger.warning("No tools found from any MCP server")
         else:
-            logger.info("Loaded %d tools from %d servers", len(self.tool_specs), len(self.servers))
+            logger.debug("Loaded %d tools from %d servers", len(self.tool_specs), len(self.servers))
 
     async def _init_and_list(self, server: MCPServer) -> Tuple[MCPServer, Any]:
         await server.initialize()
@@ -298,7 +345,7 @@ class MCPRouter:
             except (OSError, PermissionError) as e:
                 logger.debug("Local server discovery error in %s: %r", str(d), e)
         if servers:
-            logger.info("Discovered %d local MCP servers in ./servers", len(servers))
+            logger.debug("Discovered %d local MCP servers in ./servers", len(servers))
         return servers
 
 @dataclass
@@ -321,6 +368,7 @@ class ToolExecutor:
     def __init__(self, router: MCPRouter, config: AppConfig):
         self.router = router
         self.config = config
+        self._inflight: List[asyncio.Task] = []
 
     async def execute_batch(self, tool_calls: List[Dict]) -> List[ToolResult]:
         results: List[ToolResult] = []
@@ -332,16 +380,32 @@ class ToolExecutor:
             name = tc.get("function", {}).get("name", "")
             args_str = tc.get("function", {}).get("arguments", "{}")
             tool_call_id = tc.get("id", generate_tool_call_id(i, "tc"))
-            tasks.append(self._execute_single(name, args_str, tool_call_id, sem))
+            tasks.append(asyncio.create_task(self._execute_single(name, args_str, tool_call_id, sem)))
 
         if tasks:
-            task_results = await asyncio.gather(*tasks, return_exceptions=True)
+            self._inflight.extend(tasks)
+            try:
+                task_results = await asyncio.gather(*tasks, return_exceptions=True)
+            finally:
+                for t in tasks:
+                    if t in self._inflight:
+                        self._inflight.remove(t)
             for r in task_results:
                 if isinstance(r, Exception):
                     logger.error("Tool execution error: %r", r)
                 else:
                     results.append(r)
         return results
+
+    async def cancel_all(self) -> None:
+        if not self._inflight:
+            return
+        for t in list(self._inflight):
+            t.cancel()
+        try:
+            await asyncio.gather(*self._inflight, return_exceptions=True)
+        finally:
+            self._inflight.clear()
 
     async def _execute_single(self, name: str, args_str: Any, tool_call_id: str, sem: asyncio.Semaphore) -> ToolResult:
         try:
@@ -450,6 +514,7 @@ class LLMOrchestrator:
         self.theme = theme
         self.executor = ToolExecutor(router, config)
         self.conversation: List[Dict[str, Any]] = []
+        self._current_stream: Optional[Any] = None
         self._register_metrics_callback()
 
     def _register_metrics_callback(self) -> None:
@@ -556,6 +621,7 @@ class LLMOrchestrator:
     async def _stream_response(self, kwargs: Dict, show_header: bool) -> Dict[str, Any]:
         parser = StreamParser()
         stream = await litellm.acompletion(**kwargs)
+        self._current_stream = stream
         header_shown = False
         label = self.theme.label("[Assistant]", "cyan") + " "
         try:
@@ -573,7 +639,19 @@ class LLMOrchestrator:
                 await stream.aclose()
             except (RuntimeError, AttributeError):
                 logger.debug("Stream close error", exc_info=True)
+            self._current_stream = None
         return parser.get_message()
+
+    async def cancel_inflight(self) -> None:
+        try:
+            await self.executor.cancel_all()
+        except Exception:
+            pass
+        try:
+            if self._current_stream is not None:
+                await self._current_stream.aclose()
+        except Exception:
+            pass
 
 class PromptUI:
     def __init__(self, theme: AnsiTheme, config: AppConfig, metrics: Metrics, commands: List[str]):
@@ -583,6 +661,14 @@ class PromptUI:
         self._preset_text: Optional[str] = None
 
         HISTORY_FILE.parent.mkdir(parents=True, exist_ok=True)
+        # Ensure the history file exists immediately on startup
+        try:
+            if not HISTORY_FILE.exists():
+                HISTORY_FILE.touch(exist_ok=True)
+        except OSError:
+            # Non-fatal; prompt_toolkit will create as needed
+            pass
+
         self.session = PromptSession(
             history=FileHistory(str(HISTORY_FILE)),
             auto_suggest=AutoSuggestFromHistory(),
@@ -593,6 +679,7 @@ class PromptUI:
         self._bind_keys()
         self._undo_callback: Optional[Callable[[], Optional[str]]] = None
         self._redo_callback: Optional[Callable[[], bool]] = None
+        self._cancel_callback: Optional[Callable[[], None]] = None
 
     def _bind_keys(self) -> None:
         @self.kb.add('c-z')
@@ -608,9 +695,15 @@ class PromptUI:
             if self._redo_callback:
                 self._redo_callback()
 
-    def set_callbacks(self, undo_cb: Callable[[], Optional[str]], redo_cb: Callable[[], bool]) -> None:
+        @self.kb.add('escape')
+        def _(event):
+            if self._cancel_callback:
+                self._cancel_callback()
+
+    def set_callbacks(self, undo_cb: Callable[[], Optional[str]], redo_cb: Callable[[], bool], cancel_cb: Optional[Callable[[], None]] = None) -> None:
         self._undo_callback = undo_cb
         self._redo_callback = redo_cb
+        self._cancel_callback = cancel_cb
 
     def set_preset_text(self, text: Optional[str]) -> None:
         self._preset_text = text
@@ -632,7 +725,7 @@ class PromptUI:
         )
 
 class CommandHandler:
-    COMMANDS = ['/quit', '/exit', '/new', '/tools', '/model', '/reload', '/clean', '/undo', '/redo']
+    COMMANDS = ['/quit', '/exit', '/new', '/tools', '/model', '/reload', '/clear', '/undo', '/redo']
 
     def __init__(self, orchestrator: LLMOrchestrator, router: MCPRouter, config: AppConfig, theme: AnsiTheme, ui: PromptUI):
         self.orchestrator = orchestrator
@@ -640,11 +733,20 @@ class CommandHandler:
         self.config = config
         self.theme = theme
         self.ui = ui
+        self.history_file = HISTORY_FILE
 
         self._turn_stack: List[Dict[str, Any]] = []
         self._redo_stack: List[Dict[str, Any]] = []
 
-        self.ui.set_callbacks(self._undo_immediate, self._redo_immediate)
+        self._is_busy: bool = False
+        self._active_user_text: Optional[str] = None
+        self._active_start_len: Optional[int] = None
+        self._last_cancelled: bool = False
+        self._cancel_requested: bool = False
+        self._loop: Optional[asyncio.AbstractEventLoop] = None
+        self._esc_watcher = EscWatcher(self._esc_cancel)
+
+        self.ui.set_callbacks(self._undo_immediate, self._redo_immediate, self._esc_cancel)
 
     def _undo_immediate(self) -> Optional[str]:
         """Undo without printing; return prefill text for UI keybinding."""
@@ -673,25 +775,80 @@ class CommandHandler:
         if user_input.startswith('/'):
             return await self._handle_command(user_input)
 
+        self._loop = asyncio.get_running_loop()
         start_len = len(self.orchestrator.conversation)
+        self._is_busy = True
+        self._active_user_text = user_input
+        self._active_start_len = start_len
+        self._cancel_requested = False
+        # Start ESC watcher (Windows console) to allow cancellation during streaming
+        try:
+            self._esc_watcher.start()
+        except Exception:
+            pass
         try:
             with patch_stdout(raw=True):
                 await self.orchestrator.run_turn(user_input)
         except KeyboardInterrupt:
-            print("\n" + self.theme.label("[Info]", "blue") + " Response interrupted")
+            # Ctrl+C should close the session; propagate to outer loop
+            raise
         except Exception as e:
             logger.debug("Chat error", exc_info=True)
             print(self.theme.style(f"[Error] {format_exception(e)}", 'red'))
             import traceback; traceback.print_exc()
         else:
-            end_len = len(self.orchestrator.conversation)
-            turn_msgs = self.orchestrator.conversation[start_len:end_len]
-            self._turn_stack.append({
-                "messages": [m.copy() if isinstance(m, dict) else m for m in turn_msgs],
-                "user_text": user_input
-            })
-            self._redo_stack.clear()
+            if not self._cancel_requested:
+                end_len = len(self.orchestrator.conversation)
+                turn_msgs = self.orchestrator.conversation[start_len:end_len]
+                self._turn_stack.append({
+                    "messages": [m.copy() if isinstance(m, dict) else m for m in turn_msgs],
+                    "user_text": user_input
+                })
+                self._redo_stack.clear()
+        finally:
+            # If cancellation was requested, keep state for rollback in the cancel task
+            if not self._cancel_requested:
+                self._is_busy = False
+                self._active_user_text = None
+                self._active_start_len = None
+            try:
+                self._esc_watcher.stop()
+            except Exception:
+                pass
+            if not self._cancel_requested:
+                self._cancel_requested = False
         return True
+
+    def _esc_cancel(self) -> None:
+        if not self._is_busy:
+            return
+        self._cancel_requested = True
+        # Schedule async cancellation on the main loop from any thread
+        if self._loop is not None:
+            try:
+                self._loop.call_soon_threadsafe(lambda: asyncio.create_task(self._cancel_current_turn()))
+            except Exception:
+                pass
+
+    async def _cancel_current_turn(self) -> None:
+        try:
+            await self.orchestrator.cancel_inflight()
+        except Exception:
+            pass
+        # Rollback any messages produced since the start of this turn
+        if self._active_start_len is not None:
+            end_len = len(self.orchestrator.conversation)
+            if end_len > self._active_start_len:
+                del self.orchestrator.conversation[self._active_start_len:end_len]
+        # Prefill the cancelled user input
+        if self._active_user_text:
+            self.ui.set_preset_text(self._active_user_text)
+        print(self.theme.style("\n[Info] Turn cancelled (ESC). Text prefilled.", 'gray'))
+        self._is_busy = False
+        # Clear active state after rollback
+        self._active_user_text = None
+        self._active_start_len = None
+        self._cancel_requested = False
 
     async def _handle_command(self, cmd: str) -> bool:
         parts = cmd.split(maxsplit=1)
@@ -747,9 +904,29 @@ class CommandHandler:
                 logger.debug("Reload failed", exc_info=True)
                 print(self.theme.style(f"[Error] Reload failed: {format_exception(e)}", 'red'))
 
-        elif command == '/clean':
-            print("[Info] Cleanup requested")
-            return False
+        elif command == '/clear':
+            try:
+                prompt_label = ("\n" + self.theme.label("[Confirm]", "yellow") +
+                                 " Delete the 'data' directory (chat history and SQLite DB)? [Y/n] ")
+                answer = await self.ui.prompt(prompt_label)
+                choice = (answer or "y").strip().lower()
+            except (EOFError, KeyboardInterrupt):
+                choice = "y"
+
+            if choice in ("", "y", "yes"):            
+                print("[Info] Deleting 'data' directory and exiting.")
+                try:
+                    if DATA_DIR.exists():
+                        import shutil as _shutil
+                        _shutil.rmtree(DATA_DIR, ignore_errors=False)
+                    else:
+                        print(self.theme.style("[Info] No data directory to delete", 'gray'))
+                except OSError as e:
+                    print(f"[Error] Failed to delete data directory: {e}")
+                return False
+            else:
+                print(self.theme.style("[Info] Clear cancelled", 'gray'))
+                return True
 
         elif command == '/undo':
             text = self._undo_immediate()
@@ -804,7 +981,7 @@ async def amain(args: argparse.Namespace) -> None:
     print(theme.sep("LiteLLM MCP CLI Chat"))
     print(f"{theme.label('[Model]', 'magenta')} {config.model} -> {effective_model}")
     print(f"{theme.label('[Config]', 'magenta')} {args.config}")
-    print(theme.style("Commands: /new, /tools, /model, /reload, /undo (Ctrl+Z), /redo (Ctrl+Y), /quit", 'gray'))
+    print(theme.label("[Commands]", "magenta") + " " + theme.style("/new, /tools, /model, /reload, /undo (Ctrl+Z), /redo (Ctrl+Y), /clear, /quit", 'cyan'))
 
     config_path = pathlib.Path(args.config)
     if not config_path.exists():
@@ -817,7 +994,13 @@ async def amain(args: argparse.Namespace) -> None:
 
     try:
         await router.load_and_start(config_path)
-        print(f"{theme.style('✅ Connected', 'green')}: {len(router.servers)} servers, {len(router.tool_specs)} tools")
+        total_servers = len(router.servers)
+        cfg = router.configured_servers_count
+        local = router.local_servers_count
+        srv_breakdown = f"{theme.style(str(total_servers), 'bold')} servers " \
+                        f"({theme.style(str(cfg), 'cyan')} config, {theme.style(str(local), 'yellow')} local)"
+        tools_label = f"{theme.style(str(len(router.tool_specs)), 'bold')} tools"
+        print(f"{theme.style('✅ Connected', 'green')}: {srv_breakdown}, {tools_label}")
         for server, tools in sorted(router.get_server_tools_map().items()):
             print(f"  - {theme.style(server, 'cyan')}: {sorted(tools)}")
 
@@ -846,10 +1029,13 @@ async def amain(args: argparse.Namespace) -> None:
             await router.cleanup()
         except Exception as e:
             logger.warning("Cleanup error: %r", e)
+        
+        # Ensures pending tasks can complete, mitigating some cleanup warnings
         try:
-            await asyncio.sleep(0.05)
+            await asyncio.sleep(0)
         except (asyncio.CancelledError, RuntimeError):
             pass
+
         print(f"{theme.label('[Metrics]', 'magenta')} {metrics.summary()}")
 
 def main():

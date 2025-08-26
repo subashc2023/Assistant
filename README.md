@@ -157,6 +157,8 @@ Commands
 - `/reload` reconnect to MCP servers and rebuild tool list
 - `/undo` Reverts the last conversation turn. Your previous input is prefilled.
 - `/redo` Restores the last undone turn.
+- `/clear` Deletes the entire `data/` directory (including `.chat_history` and any SQLite DB) and exits.
+  - Prompts for confirmation (default Yes) because this is destructive.
 - `/quit` or `/exit` exit
 
 CLI flags
@@ -177,6 +179,12 @@ uv run client.py --help
 --log-level LEVEL                DEBUG|INFO|WARNING|ERROR
 --log-json                       Output structured JSON logs to stderr
 ```
+
+Data directory and history
+--------------------------
+- Chat history is stored at `data/.chat_history` and is created at startup.
+- Local MCP sample(s) may create `data/test.db` (via the SQLite Docker container).
+- Use `/clear` to delete the entire `data/` directory in one go (removes the DB and history).
 
 Built-in model aliases
 ----------------------

@@ -37,7 +37,6 @@ Instructions: {props.get('instruction', 'No specific instructions provided')}
 @mcp.tool()
 async def get_alerts(state: str) -> str:
     """Get weather alerts for a US state.
-
     Args:
         state: Two-letter US state code (e.g. CA, NY)
     """
@@ -56,7 +55,6 @@ async def get_alerts(state: str) -> str:
 @mcp.tool()
 async def get_forecast(latitude: float, longitude: float) -> str:
     """Get weather forecast for a location.
-
     Args:
         latitude: Latitude of the location
         longitude: Longitude of the location

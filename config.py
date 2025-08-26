@@ -148,7 +148,7 @@ class AppConfig:
         if provider and provider in PROVIDERS:
             cap = PROVIDERS[provider].get('max_tokens_cap')
             if cap and requested_tokens > cap:
-                print(f"[Info] Capping max_tokens to {cap} for {provider}")
+                # Silently cap without emitting an info line
                 return cap
         return requested_tokens
 
