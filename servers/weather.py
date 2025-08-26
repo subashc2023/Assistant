@@ -2,15 +2,15 @@ from typing import Any
 import httpx
 from mcp.server.fastmcp import FastMCP
 
-
+# Initialize FastMCP server
 mcp = FastMCP("weather")
 
-
+# Constants
 NWS_API_BASE = "https://api.weather.gov"
 USER_AGENT = "weather-app/1.0"
 
 async def make_nws_request(url: str) -> dict[str, Any] | None:
-
+    """Make a request to the NWS API with proper error handling."""
     headers = {
         "User-Agent": USER_AGENT,
         "Accept": "application/geo+json"
@@ -24,7 +24,7 @@ async def make_nws_request(url: str) -> dict[str, Any] | None:
             return None
 
 def format_alert(feature: dict) -> str:
-
+    """Format an alert feature into a readable string."""
     props = feature["properties"]
     return f"""
 Event: {props.get('event', 'Unknown')}
@@ -68,17 +68,17 @@ async def get_forecast(latitude: float, longitude: float) -> str:
     if not points_data:
         return "Unable to fetch forecast data for this location."
 
-
+    # Get the forecast URL from the points response
     forecast_url = points_data["properties"]["forecast"]
     forecast_data = await make_nws_request(forecast_url)
 
     if not forecast_data:
         return "Unable to fetch detailed forecast."
 
-
+    # Format the periods into a readable forecast
     periods = forecast_data["properties"]["periods"]
     forecasts = []
-    for period in periods[:5]:
+    for period in periods[:5]:  # Only show next 5 periods
         forecast = f"""
 {period['name']}:
 Temperature: {period['temperature']}°{period['temperatureUnit']}
@@ -90,5 +90,5 @@ Forecast: {period['detailedForecast']}
     return "\n---\n".join(forecasts)
 
 if __name__ == "__main__":
-
+    # Initialize and run the server
     mcp.run(transport='stdio')
