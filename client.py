@@ -103,9 +103,6 @@ def create_theme(config: AppConfig) -> AnsiTheme:
     return AnsiTheme(enabled=enabled)
 
 class EscWatcher:
-    """Windows-only ESC key watcher running in a background thread.
-    Calls the provided callback on ESC press. Start/stop controlled externally.
-    """
     def __init__(self, on_escape: Callable[[], None]):
         self.on_escape = on_escape
         self._stop_flag = threading.Event()
@@ -130,14 +127,13 @@ class EscWatcher:
             try:
                 if msvcrt.kbhit():
                     ch = msvcrt.getwch()
-                    if ch == '\x1b':  # ESC
+                    if ch == '\x1b':
                         try:
                             self.on_escape()
                         except Exception:
                             pass
                 time.sleep(0.03)
             except Exception:
-                # Best-effort; ignore and keep loop
                 time.sleep(0.05)
 
 class MCPServer:
@@ -235,7 +231,6 @@ class MCPRouter:
             if name not in raw_servers:
                 raw_servers[name] = cfg
 
-        # Track counts: configured vs local (non-conflicting) servers
         self.configured_servers_count = len(original_config_names)
         self.local_servers_count = sum(1 for n in discovered.keys() if n not in original_config_names)
 
@@ -661,12 +656,10 @@ class PromptUI:
         self._preset_text: Optional[str] = None
 
         HISTORY_FILE.parent.mkdir(parents=True, exist_ok=True)
-        # Ensure the history file exists immediately on startup
         try:
             if not HISTORY_FILE.exists():
                 HISTORY_FILE.touch(exist_ok=True)
         except OSError:
-            # Non-fatal; prompt_toolkit will create as needed
             pass
 
         self.session = PromptSession(
@@ -749,7 +742,6 @@ class CommandHandler:
         self.ui.set_callbacks(self._undo_immediate, self._redo_immediate, self._esc_cancel)
 
     def _undo_immediate(self) -> Optional[str]:
-        """Undo without printing; return prefill text for UI keybinding."""
         if not self._turn_stack:
             return None
         record = self._turn_stack.pop()
@@ -761,7 +753,6 @@ class CommandHandler:
         return record["user_text"]
 
     def _redo_immediate(self) -> bool:
-        """Redo without printing; return True if done."""
         if not self._redo_stack:
             return False
         record = self._redo_stack.pop()
@@ -781,7 +772,6 @@ class CommandHandler:
         self._active_user_text = user_input
         self._active_start_len = start_len
         self._cancel_requested = False
-        # Start ESC watcher (Windows console) to allow cancellation during streaming
         try:
             self._esc_watcher.start()
         except Exception:
@@ -790,7 +780,6 @@ class CommandHandler:
             with patch_stdout(raw=True):
                 await self.orchestrator.run_turn(user_input)
         except KeyboardInterrupt:
-            # Ctrl+C should close the session; propagate to outer loop
             raise
         except Exception as e:
             logger.debug("Chat error", exc_info=True)
@@ -806,7 +795,6 @@ class CommandHandler:
                 })
                 self._redo_stack.clear()
         finally:
-            # If cancellation was requested, keep state for rollback in the cancel task
             if not self._cancel_requested:
                 self._is_busy = False
                 self._active_user_text = None
@@ -835,17 +823,14 @@ class CommandHandler:
             await self.orchestrator.cancel_inflight()
         except Exception:
             pass
-        # Rollback any messages produced since the start of this turn
         if self._active_start_len is not None:
             end_len = len(self.orchestrator.conversation)
             if end_len > self._active_start_len:
                 del self.orchestrator.conversation[self._active_start_len:end_len]
-        # Prefill the cancelled user input
         if self._active_user_text:
             self.ui.set_preset_text(self._active_user_text)
         print(self.theme.style("\n[Info] Turn cancelled (ESC). Text prefilled.", 'gray'))
         self._is_busy = False
-        # Clear active state after rollback
         self._active_user_text = None
         self._active_start_len = None
         self._cancel_requested = False
@@ -913,7 +898,7 @@ class CommandHandler:
             except (EOFError, KeyboardInterrupt):
                 choice = "y"
 
-            if choice in ("", "y", "yes"):            
+            if choice in ("", "y", "yes"):
                 print("[Info] Deleting 'data' directory and exiting.")
                 try:
                     if DATA_DIR.exists():
@@ -1029,8 +1014,7 @@ async def amain(args: argparse.Namespace) -> None:
             await router.cleanup()
         except Exception as e:
             logger.warning("Cleanup error: %r", e)
-        
-        # Ensures pending tasks can complete, mitigating some cleanup warnings
+
         try:
             await asyncio.sleep(0)
         except (asyncio.CancelledError, RuntimeError):

@@ -1,7 +1,7 @@
 Assistant (LiteLLM + MCP CLI)
 ================================
 
-Minimal, fast CLI that streams responses from an LLM (via LiteLLM) and executes Model Context Protocol (MCP) tools over stdio. It auto-discovers tools from configured MCP servers and exposes them to the model as OpenAI-style function tools. Built for reliability: parallel tool calls, timeouts, and result truncation.
+Minimal, fast CLI that streams responses from an LLM (via LiteLLM) and executes Model Context Protocol (MCP) tools over stdio. It auto-discovers tools from configured MCP servers and exposes them to the model as OpenAI-style function tools. Built to be simple and reliable, with parallel calls, timeouts, and result truncation for Functions/Tools
 
 Supports MCP in two ways:
 - Local Python MCP servers discovered from the `servers/` directory
@@ -9,7 +9,7 @@ Supports MCP in two ways:
 
 Why this exists
 ----------------
-- Simple: a single Python script wired to LiteLLM and MCP
+- Simple: a single Python script wired to LiteLLM and MCP - in ~1000 LoC
 - Productive: live streaming output, tooling discovery, and batch tool execution
 - Practical: provider auto-detect, token caps, structured tool results, and sane defaults
 - Efficient: Starts MCP Server Docker Containers, and automatically cleans up on quit/termination
@@ -136,17 +136,18 @@ You should see something like:
 === LiteLLM MCP CLI Chat ===
 Model: groq/llama-3.3-70b-versatile
 Config: mcp_config.json
-Type '/quit' or '/exit' to exit. Commands: /new, /tools, /model, /reload, /undo, /redo, /quit
+Commands: /new, /tools, /model, /reload, /undo, /redo, /quit
 ✅ Connected: 2 servers, N tools
   - filesystem: [...]
   - sqlite: [...]
 
-[You]
+[You] ...
 ```
 
 Usage
 -----
 Type a prompt at `[You]`. The assistant will stream output. 
+
 Note : LiteLLM Does not stream tool calls, as some of its constituent providers do not support this feature. :(
 
 Commands
@@ -158,7 +159,6 @@ Commands
 - `/undo` Reverts the last conversation turn. Your previous input is prefilled.
 - `/redo` Restores the last undone turn.
 - `/clear` Deletes the entire `data/` directory (including `.chat_history` and any SQLite DB) and exits.
-  - Prompts for confirmation (default Yes) because this is destructive.
 - `/quit` or `/exit` exit
 
 CLI flags
@@ -183,45 +183,20 @@ uv run client.py --help
 Data directory and history
 --------------------------
 - Chat history is stored at `data/.chat_history` and is created at startup.
-- Local MCP sample(s) may create `data/test.db` (via the SQLite Docker container).
-- Use `/clear` to delete the entire `data/` directory in one go (removes the DB and history).
+- MCP server sample(s) may create `data/test.db` (via the SQLite Docker container).
+- Use `/clear` to delete the entire `data/` directory in one go, while quitting (removes the DB and history).
 
 Built-in model aliases
 ----------------------
 Aliases are built-in and loaded into LiteLLM automatically. Use `/model <alias>` to switch.
 
-Groq:
-```
-llamaS -> groq/llama-3.1-8b-instant
-llamaL -> groq/llama-3.3-70b-versatile
-oss    -> groq/openai/gpt-oss-120b
-```
+Aliases are defined in config.py
 
-Anthropic:
-```
-haiku  -> anthropic/claude-3-5-haiku-latest
-sonnet -> anthropic/claude-3-7-sonnet-20250219
-opus   -> anthropic/claude-3-opus-20240229
-```
 
-OpenAI:
-```
-4o      -> openai/gpt-4o
-4omini  -> openai/gpt-4o-mini
-4.1     -> openai/gpt-4.1
-4.1mini -> openai/gpt-4.1-mini
-```
-
-Gemini:
-```
-flash -> gemini/gemini-2.5-flash
-pro   -> gemini/gemini-2.5-pro
-lite  -> gemini/gemini-2.5-lite
-```
 
 Notes:
 - Provider auth and token caps are validated against the resolved target model.
-- `/model` without args lists the current model and all aliases.
+- `/model` without args lists the current model and all aliases in config.
 
 Configuration details
 ---------------------
@@ -231,7 +206,7 @@ Providers and models
 - Provider detection: prefix/keyword heuristics (`detect_provider`)
 - Token caps per provider: `config.py:PROVIDERS[*].max_tokens_cap`; enforced by `_apply_token_cap`
 
-Environment variables
+Environment variables - need at least one of the following
 - OpenAI: `OPENAI_API_KEY`
 - Anthropic: `ANTHROPIC_API_KEY`
 - Gemini: `GEMINI_API_KEY` or `GOOGLE_API_KEY`
@@ -247,3 +222,11 @@ Local MCP servers (`servers/*.py`)
 - Auto-discovered and executed with `sys.executable` over stdio
 - Name is derived from file stem; tools are exposed as `<server>_<tool>`
 - Overrides: entries in `mcp_config.json`
+
+# TODO
+  - /dump to dump raw json to file
+  - /save to dump reader friendly chat history to file
+  - smart truncation of tool result jsons to save to file if its too big, and show schema, instead of filling up context window.
+  - smart history management with rolling window, to drop old tool calls, thinking sessions, and really old messages, that probably wont be needed
+  - even smarter history management that uses another LLM to summarize message history on the fly
+  - Continous Heirarchical Architecture, with 2 models running at all times, A small one managing state, context, etc. with another large one actually performing actions as necessary.
