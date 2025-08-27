@@ -243,9 +243,20 @@ class MCPRouter:
         self.tool_to_server.clear()
         self.tool_name_map.clear()
 
-        results = await asyncio.gather(*[self._init_and_list(s) for s in self.servers])
-        for server, tools_resp in results:
-            self._register_server_tools(server, tools_resp)
+        init_tasks = [self._init_and_list(s) for s in self.servers]
+        results = await asyncio.gather(*init_tasks, return_exceptions=True)
+
+        successful_servers = []
+        for i, result in enumerate(results):
+            server = self.servers[i]
+            if isinstance(result, Exception):
+                logger.warning("Server '%s' failed to initialize: %r", server.name, result)
+                continue
+            server_obj, tools_resp = result
+            successful_servers.append(server_obj)
+            self._register_server_tools(server_obj, tools_resp)
+
+        self.servers = successful_servers
 
         if not self.tool_specs:
             logger.warning("No tools found from any MCP server")
@@ -253,9 +264,13 @@ class MCPRouter:
             logger.debug("Loaded %d tools from %d servers", len(self.tool_specs), len(self.servers))
 
     async def _init_and_list(self, server: MCPServer) -> Tuple[MCPServer, Any]:
-        await server.initialize()
-        tools = await server.list_tools()
-        return server, tools
+        try:
+            await server.initialize()
+            tools = await server.list_tools()
+            return server, tools
+        except Exception as e:
+            logger.warning("Failed to initialize server '%s': %r", server.name, e)
+            raise
 
     def _register_server_tools(self, server: MCPServer, tools_resp: Any) -> None:
         for tool in tools_resp.tools:
